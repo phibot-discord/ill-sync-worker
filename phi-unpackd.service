@@ -1,0 +1,16 @@
+[Unit]
+Description=Phigros APK unpacker
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/mnt/nvme/phi/ill-sync
+EnvironmentFile=/mnt/nvme/phi/ill-sync/unpackd.env
+ExecStart=/mnt/nvme/phi/ill-sync/phi-unpackd
+Restart=on-failure
+RestartSec=3
+# Unpacking uses up to 8 cores (UNPACK_THREADS); keep the desktop responsive
+Nice=10
+
+[Install]
+WantedBy=default.target

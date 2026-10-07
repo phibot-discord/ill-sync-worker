@@ -1,0 +1,24 @@
+[package]
+name = "phi-unpackd"
+version = "0.1.0"
+edition = "2021"
+description = "Phigros APK unpacker that runs on fedodesk"
+# File::lock (cross-process run lock) is stable since 1.89
+rust-version = "1.89"
+
+[dependencies]
+image = { version = "0.24.9", default-features = false, features = ["png"] }
+md-5 = "0.10"
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
+serde_json = "1"
+tiny_http = "0.12"
+zip = { version = "0.6", default-features = false, features = ["deflate"] }
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+
+# Image kernels are ~60x slower unoptimised; keep tests and dev runs usable
+[profile.dev.package."*"]
+opt-level = 3
