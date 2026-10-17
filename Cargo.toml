@@ -7,7 +7,9 @@ description = "Phigros APK unpacker that runs on fedodesk"
 rust-version = "1.89"
 
 [dependencies]
-image = { version = "0.24.9", default-features = false, features = ["png"] }
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc"] }
+image = { version = "0.24.9", default-features = false, features = ["png", "jpeg"] }
 md-5 = "0.10"
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"

@@ -342,10 +342,8 @@ struct OggStream {
     seq: u32,
     lacing: Vec<u8>,
     body: Vec<u8>,
-    /// Packets that end on the current page, and the granule of the last of them
     packets: usize,
     granule: i64,
-    /// The current page starts with the tail of a packet begun on the previous page
     continued: bool,
     last_page: Option<usize>,
 }

@@ -1,5 +1,7 @@
 pub mod audio;
 pub mod catalog;
+pub mod collection;
+pub mod collection_art;
 pub mod cursor;
 pub mod extract;
 pub mod files;
@@ -10,7 +12,9 @@ pub mod layout;
 pub mod par;
 pub mod pez;
 pub mod publish;
+pub mod pv;
 pub mod serialized;
 pub mod taptap;
 pub mod texture;
+pub mod unity;
 pub mod unityfs;

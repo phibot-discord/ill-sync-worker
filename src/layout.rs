@@ -1,10 +1,12 @@
 use crate::catalog::Want;
+use crate::collection_art;
 use crate::files::write_if_changed;
+use crate::pv;
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const LEVELS: [&str; 4] = ["EZ", "HD", "IN", "AT"];
+pub const LEVELS: [&str; 4] = ["EZ", "HD", "IN", "AT"];
 
 pub fn should_skip(check: bool, prev_code: &str, prev_status: &str, next_code: &str) -> bool {
     check && !prev_code.is_empty() && prev_code == next_code && prev_status == "ok"
@@ -19,9 +21,18 @@ pub fn song_id(folder: &str) -> &str {
 pub fn output_path(want: &Want) -> String {
     match want {
         Want::Chart { folder, diff } => format!("chart/{folder}/{diff}.json"),
-        Want::Jacket { folder } => format!("illustration/{}.png", song_id(folder)),
+        Want::Jacket {
+            folder,
+            level: None,
+        } => format!("illustration/{}.png", song_id(folder)),
+        Want::Jacket {
+            folder,
+            level: Some(level),
+        } => format!("illustration/{level}/{}.png", song_id(folder)),
         Want::Music { folder } => format!("music/{}.ogg", song_id(folder)),
         Want::Avatar { name } => format!("avatar/{name}.png"),
+        Want::Video { name, .. } => pv::video_file(&pv::clip_id(name)),
+        Want::CollectionArt { id, .. } => collection_art::png_file(id),
     }
 }
 
@@ -66,7 +77,7 @@ pub fn write_info_tsv(output: &Path) -> Result<usize, String> {
     Ok(count)
 }
 
-fn text(v: &Value) -> String {
+pub(crate) fn text(v: &Value) -> String {
     match v {
         Value::String(s) => s.trim().to_string(),
         Value::Number(n) => n.to_string(),
@@ -95,7 +106,7 @@ fn lang(v: &Value) -> String {
     text(v)
 }
 
-fn fmt_diff(v: &Value) -> String {
+pub(crate) fn fmt_diff(v: &Value) -> String {
     match v {
         Value::Number(n) => n.as_f64().map(|n| format!("{n:.1}")).unwrap_or_default(),
         Value::String(s) if !s.is_empty() => s
@@ -106,7 +117,10 @@ fn fmt_diff(v: &Value) -> String {
     }
 }
 
-fn walk(dir: &Path, f: &mut dyn FnMut(&Path) -> Result<(), String>) -> Result<(), String> {
+pub(crate) fn walk(
+    dir: &Path,
+    f: &mut dyn FnMut(&Path) -> Result<(), String>,
+) -> Result<(), String> {
     if !dir.exists() {
         return Ok(());
     }
@@ -165,14 +179,38 @@ mod tests {
             "music/Stasis.Maozon.ogg"
         );
         assert_eq!(
-            output_path(&Want::Jacket { folder }),
+            output_path(&Want::Jacket {
+                folder: folder.clone(),
+                level: None
+            }),
             "illustration/Stasis.Maozon.png"
+        );
+        assert_eq!(
+            output_path(&Want::Jacket {
+                folder,
+                level: Some("IN".into())
+            }),
+            "illustration/IN/Stasis.Maozon.png"
         );
         assert_eq!(
             output_path(&Want::Avatar {
                 name: "Burn".into()
             }),
             "avatar/Burn.png"
+        );
+        assert_eq!(
+            output_path(&Want::Video {
+                group: "Chapter9".into(),
+                name: "Exoplanetary Mirage_Intro".into()
+            }),
+            "pv/video/exoplanetary-mirage-intro.mp4"
+        );
+        assert_eq!(
+            output_path(&Want::CollectionArt {
+                id: "thewall0".into(),
+                source: "Assets/Chapter9/Arts/thewall0.jpg".into()
+            }),
+            "collection-art/thewall0.png"
         );
         assert_eq!(song_id("Re.0ne.0"), "Re.0ne");
         assert_eq!(song_id("Foo.0.0"), "Foo.0");

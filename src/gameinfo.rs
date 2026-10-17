@@ -1,6 +1,7 @@
 use crate::cursor::Cursor;
 use serde::Serialize;
 use serde_json::{json, Map, Value};
+use std::collections::BTreeMap;
 
 #[derive(Clone, Debug)]
 pub struct Song {
@@ -222,24 +223,59 @@ fn parse_one(data: &[u8], at: usize) -> Result<(Song, usize), String> {
     ))
 }
 
+/// Unity's `SystemLanguage` values that key `TipsProvider`'s lists, as the Collection's language codes
+const TIP_LANGS: [(i32, &str); 5] = [
+    (40, "zh-CN"),
+    (41, "zh-TW"),
+    (10, "en"),
+    (22, "ja"),
+    (23, "ko"),
+];
+
+/// The loading-screen tips in Simplified Chinese
 pub fn parse_tips(data: &[u8]) -> Result<Vec<String>, String> {
+    parse_tip_lists(data)?
+        .remove("zh-CN")
+        .ok_or_else(|| "tips list not found".into())
+}
+
+/// `TipsProvider`'s list for each game language: a `SystemLanguage` value, then a string array that starts with
+/// the same `!!` tip in every language
+pub fn parse_tip_lists(data: &[u8]) -> Result<BTreeMap<&'static str, Vec<String>>, String> {
     let needle = b"\x02\x00\x00\x00!!";
+    let mut lists = BTreeMap::new();
     let mut from = 0;
     while let Some(rel) = data[from..].windows(needle.len()).position(|w| w == needle) {
         let at = from + rel;
-        if at >= 4 {
-            let count = i32::from_le_bytes(data[at - 4..at].try_into().unwrap());
-            if (20..=500).contains(&count) {
-                if let Ok(tips) = read_string_array(data, at - 4) {
-                    if tips.iter().any(|t| t.contains("Sound Only")) {
-                        return Ok(tips);
-                    }
-                }
+        from = at + 1;
+        if at < 8 {
+            continue;
+        }
+        let count = i32::from_le_bytes(data[at - 4..at].try_into().unwrap());
+        if !(20..=500).contains(&count) {
+            continue;
+        }
+        let language = i32::from_le_bytes(data[at - 8..at - 4].try_into().unwrap());
+        let Some((_, lang)) = TIP_LANGS.iter().find(|(value, _)| *value == language) else {
+            continue;
+        };
+        if let Ok(tips) = read_string_array(data, at - 4) {
+            if tips.iter().any(|t| t.contains("Sound Only")) {
+                lists.entry(*lang).or_insert(tips);
             }
         }
-        from = at + 1;
     }
-    Err("tips list not found".into())
+    if !lists.contains_key("zh-CN") {
+        return Err("tips list not found".into());
+    }
+    Ok(lists)
+}
+
+pub const TIPS_MANIFEST: &str = "tips/index.json";
+
+/// `tips/index.json`: every game language's loading tips
+pub fn tip_lists_json(lists: &BTreeMap<&'static str, Vec<String>>) -> Value {
+    json!({ "v": 1, "langs": lists })
 }
 
 fn read_string_array(data: &[u8], at: usize) -> Result<Vec<String>, String> {
@@ -347,5 +383,29 @@ mod tests {
         let avatars = parse_avatars(&data).unwrap();
         assert_eq!(avatars.len(), 109, "{}", avatars.len());
         assert_eq!(avatars[0].key, "avatar.Glaciaxion");
+    }
+
+    #[test]
+    fn reads_the_tips_of_every_language_in_the_401_apk() {
+        let Ok(level0) = std::fs::read("/tmp/phi-fixtures/level0") else {
+            return;
+        };
+        let lists = parse_tip_lists(&level0).unwrap();
+        let counts: Vec<(&str, usize)> = lists.iter().map(|(k, v)| (*k, v.len())).collect();
+        assert_eq!(
+            counts,
+            [
+                ("en", 130),
+                ("ja", 192),
+                ("ko", 187),
+                ("zh-CN", 192),
+                ("zh-TW", 192)
+            ]
+        );
+        assert_eq!(lists["en"][2], "(•▴• )Coo coo~");
+        assert_eq!(parse_tips(&level0).unwrap(), lists["zh-CN"]);
+        let json = tip_lists_json(&lists);
+        assert_eq!(json["v"], 1);
+        assert_eq!(json["langs"]["ko"][2], "(•▴• )구구~");
     }
 }

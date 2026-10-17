@@ -1,11 +1,16 @@
 use crate::audio;
 use crate::catalog::{self, Want};
+use crate::collection;
+use crate::collection_art;
 use crate::files::{self, write_if_changed};
 use crate::gameinfo::{self, VersionFile};
 use crate::jackets;
-use crate::layout::{self, song_id};
+use crate::layout::{self, song_id, LEVELS};
 use crate::par;
+use crate::pv;
+use crate::serialized;
 use crate::texture;
+use crate::unity;
 use crate::unityfs;
 use serde::Deserialize;
 use serde_json::Value;
@@ -17,10 +22,16 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use zip::ZipArchive;
 
-const LEVELS: [&str; 4] = ["EZ", "HD", "IN", "AT"];
+const PACKED_DATA: &str = "assets/bin/Data/data.unity3d";
+/// The il2cpp string table: what the game's code says, byte for byte
+pub const METADATA: &str = "assets/bin/Data/Managed/Metadata/global-metadata.dat";
+
+/// Relative to the output root and the R2 bucket: `{ v: 1, songs: { <id>: [<level>, …] } }` for the songs
+/// whose jackets exist per difficulty (`original_ill/{ill,illLow,illBlur}/<level>/<id>.png`)
+pub const LEVELS_MANIFEST: &str = "original_ill/levels.json";
 
 /// Directories extract owns. Files in them that this run did not produce are deleted afterwards
-const OWNED_DIRS: [&str; 7] = [
+const OWNED_DIRS: [&str; 10] = [
     "chart",
     "music",
     "illustration",
@@ -28,16 +39,352 @@ const OWNED_DIRS: [&str; 7] = [
     "illustrationBlur",
     "avatar",
     "original_ill",
+    "pv",
+    "collection",
+    collection_art::DIR,
 ];
 
 /// Note counts `[tap, drag, hold, flick]` and the last note end, in chart time units
-type NoteCounts = ([u32; 4], f64);
+pub type NoteCounts = ([u32; 4], f64);
 /// NoteCounts per track folder and level
 type ChartStats = BTreeMap<String, BTreeMap<String, NoteCounts>>;
 
 pub struct Exported {
     pub jackets: usize,
     pub bundles: usize,
+    pub clips: usize,
+    pub collection: usize,
+    pub arts: usize,
+    pub warnings: Vec<String>,
+}
+
+/// The videos, the Collection and its art. A part that cannot be read is skipped, not a failed run: its old output
+/// is kept and its directory is not pruned
+#[derive(Default)]
+struct Extras {
+    written: HashSet<PathBuf>,
+    keep: Vec<&'static str>,
+    warnings: Vec<String>,
+    clips: usize,
+    collection: usize,
+    arts: usize,
+}
+
+impl Extras {
+    fn failed(&mut self, dir: &'static str, err: &str) {
+        let warning = format!("{dir} skipped: {err}");
+        eprintln!("{warning}");
+        self.warnings.push(warning);
+        self.keep.push(dir);
+    }
+
+    /// A part that was exported without something it could not read
+    fn warn(&mut self, dir: &str, warning: &str) {
+        let warning = format!("{dir}: {warning}");
+        eprintln!("{warning}");
+        self.warnings.push(warning);
+    }
+}
+
+fn export_extras(
+    zip: &mut ZipArchive<File>,
+    packed: Option<&[u8]>,
+    videos: &[catalog::BundleJob],
+    arts: &[catalog::BundleJob],
+    output: &Path,
+) -> Extras {
+    let mut out = Extras::default();
+    let parsed = packed
+        .ok_or_else(|| "apk has no data.unity3d".to_string())
+        .and_then(|bytes| unityfs::decode_where(bytes, |n| !unityfs::is_resource(n)))
+        .map(|nodes| {
+            nodes
+                .into_iter()
+                .map(|n| (n.name, n.bytes))
+                .collect::<HashMap<_, _>>()
+        })
+        .and_then(|nodes| pv::scenes_in(&nodes).map(|scenes| (nodes, scenes)));
+    match parsed {
+        Ok((nodes, scenes)) => {
+            match export_pv(zip, &nodes, &scenes, videos, output, &mut out.written) {
+                Ok(clips) => out.clips = clips,
+                Err(err) => out.failed("pv", &err),
+            }
+            match export_collection(&nodes, &scenes, output, &mut out.written) {
+                Ok(entries) => out.collection = entries,
+                Err(err) => out.failed("collection", &err),
+            }
+            match export_collection_art(
+                zip,
+                packed,
+                &nodes,
+                &scenes,
+                arts,
+                output,
+                &mut out.written,
+            ) {
+                Ok(art) => {
+                    out.arts = art.images;
+                    for warning in &art.warnings {
+                        out.warn(collection_art::DIR, warning);
+                    }
+                }
+                Err(err) => out.failed(collection_art::DIR, &err),
+            }
+        }
+        Err(err) => {
+            out.failed("pv", &err);
+            out.failed("collection", &err);
+            out.failed(collection_art::DIR, &err);
+        }
+    }
+    out
+}
+
+fn export_pv(
+    zip: &mut ZipArchive<File>,
+    nodes: &HashMap<String, Vec<u8>>,
+    scenes: &[String],
+    videos: &[catalog::BundleJob],
+    output: &Path,
+    written: &mut HashSet<PathBuf>,
+) -> Result<usize, String> {
+    let mut entries = pv::export_player_clips(
+        nodes,
+        scenes,
+        &mut |path| read_zip(zip, path),
+        output,
+        written,
+    )?;
+    for job in videos {
+        let Want::Video { group, name } = &job.want else {
+            continue;
+        };
+        let bytes = read_zip(zip, &job.zip_path)?;
+        let bundle = unityfs::decode(&bytes).map_err(|e| format!("{}: {e}", job.zip_path))?;
+        drop(bytes);
+        let (clip, mp4) = pv::clip_in_bundle(&bundle).map_err(|e| format!("{name}: {e}"))?;
+        let entry = pv::Entry {
+            id: pv::clip_id(name),
+            name: name.clone(),
+            scene: None,
+            group: group.clone(),
+            clip,
+        };
+        files::write_and_keep(output.join(entry.file()), mp4, written)?;
+        entries.push(entry);
+    }
+    let mut ids = HashSet::new();
+    if let Some(dup) = entries.iter().find(|e| !ids.insert(e.id.clone())) {
+        return Err(format!("two clips are called {}", dup.id));
+    }
+    if entries.is_empty() {
+        return Err("no video clips".into());
+    }
+    files::write_and_keep(output.join(pv::MANIFEST), &pv::manifest(&entries)?, written)?;
+    Ok(entries.len())
+}
+
+fn export_collection(
+    nodes: &HashMap<String, Vec<u8>>,
+    scenes: &[String],
+    output: &Path,
+    written: &mut HashSet<PathBuf>,
+) -> Result<usize, String> {
+    let at = scenes
+        .iter()
+        .position(|s| s.ends_with("/SaturnOS.unity"))
+        .ok_or("no SaturnOS scene")?;
+    let scene = nodes
+        .get(&format!("level{at}"))
+        .ok_or("no SaturnOS scene data")?;
+    let content = nodes
+        .get(&format!("sharedassets{at}.assets"))
+        .ok_or("no SaturnOS streamed data")?;
+    let level0 = nodes.get("level0").ok_or("no level0")?;
+    let collection = collection::parse(level0, scene, content)?;
+    let mut outputs = vec![(collection::INDEX.to_string(), collection.index()?)];
+    for (n, lang) in collection::LANGS.iter().enumerate() {
+        outputs.push((collection::text_path(lang), collection.texts(n)?));
+    }
+    for (rel, body) in outputs {
+        files::write_and_keep(output.join(rel), &body, written)?;
+    }
+    Ok(collection.entries())
+}
+
+struct ArtExport {
+    images: usize,
+    warnings: Vec<String>,
+}
+
+/// The Chapter 9 maps' illustrations and the panel each collection entry opens in. Every image is decoded and
+/// encoded before anything is written, and the manifest goes last
+fn export_collection_art(
+    zip: &mut ZipArchive<File>,
+    packed: Option<&[u8]>,
+    nodes: &HashMap<String, Vec<u8>>,
+    scenes: &[String],
+    arts: &[catalog::BundleJob],
+    output: &Path,
+    written: &mut HashSet<PathBuf>,
+) -> Result<ArtExport, String> {
+    let items = collection::parse_items(nodes.get("level0").ok_or("no level0")?)?;
+    let mut calls = Vec::new();
+    let mut maps = Vec::new();
+    for (n, scene) in scenes.iter().enumerate() {
+        if let Some(level) = nodes.get(&format!("level{n}")) {
+            let found = collection_art::scene_calls(level);
+            if !found.is_empty() {
+                maps.push(n);
+            }
+            calls.extend(found.into_iter().map(|call| (scene.clone(), call)));
+        }
+    }
+    let (tiles, mut warnings) = match packed {
+        Some(packed) => map_tiles(packed, nodes, &maps),
+        None => (
+            Vec::new(),
+            vec!["no map tiles: apk has no data.unity3d".into()],
+        ),
+    };
+    let mut found = Vec::new();
+    let mut images = HashMap::new();
+    for job in arts {
+        let Want::CollectionArt { id, source } = &job.want else {
+            continue;
+        };
+        let ctx = |e: String| format!("{source}: {e}");
+        let (rgb, _) = art_rgb(&read_zip(zip, &job.zip_path)?).map_err(ctx)?;
+        let png = texture::encode_rgb_png(&rgb).map_err(ctx)?;
+        let jpg = texture::encode_rgb_jpeg(&rgb, collection_art::JPEG_QUALITY).map_err(ctx)?;
+        found.push(collection_art::Art {
+            id: id.clone(),
+            source: source.clone(),
+            width: rgb.width(),
+            height: rgb.height(),
+        });
+        images.insert(id.clone(), (png, jpg));
+    }
+    let (mut entries, more) = collection_art::place(&items, calls, found)?;
+    warnings.extend(more);
+    let mut tile_pngs = HashMap::new();
+    let mut placed_tiles = Vec::new();
+    for (tile, tex) in tiles {
+        match texture::encode_png(&tex) {
+            Ok(png) => {
+                tile_pngs.insert(tile.id.clone(), png);
+                placed_tiles.push(tile);
+            }
+            Err(err) => warnings.push(format!("map tile {}: {err}", tile.id)),
+        }
+    }
+    warnings.extend(collection_art::attach_tiles(&mut entries, placed_tiles));
+    let shown: Vec<&collection_art::Art> = entries.iter().filter_map(|e| e.art.as_ref()).collect();
+    if shown.is_empty() {
+        return Err("no collection art".into());
+    }
+    for art in &shown {
+        let (png, jpg) = &images[&art.id];
+        files::write_and_keep(output.join(collection_art::png_file(&art.id)), png, written)?;
+        files::write_and_keep(output.join(collection_art::jpg_file(&art.id)), jpg, written)?;
+    }
+    for tile in entries.iter().filter_map(|e| e.tile.as_ref()) {
+        if let Some(png) = tile_pngs.get(&tile.id) {
+            files::write_and_keep(
+                output.join(collection_art::tile_file(&tile.id)),
+                png,
+                written,
+            )?;
+        }
+    }
+    files::write_and_keep(
+        output.join(collection_art::MANIFEST),
+        &collection_art::manifest(&entries)?,
+        written,
+    )?;
+    Ok(ArtExport {
+        images: shown.len(),
+        warnings,
+    })
+}
+
+/// The tiles of the map scenes (`maps`, build indexes): each scene read with the shared files its objects reference
+/// and the streamed texture data of its own shared assets
+fn map_tiles(
+    packed: &[u8],
+    nodes: &HashMap<String, Vec<u8>>,
+    maps: &[usize],
+) -> collection_art::SceneTiles {
+    let mut tiles = Vec::new();
+    let mut warnings = Vec::new();
+    for &n in maps {
+        let own = format!("sharedassets{n}.assets");
+        let streamed = match unityfs::decode_where(packed, |name| {
+            unityfs::is_resource(name) && name.starts_with(&own) && name.ends_with(".resS")
+        }) {
+            Ok(found) => found,
+            Err(err) => {
+                warnings.push(format!("map tiles of scene {n}: {err}"));
+                continue;
+            }
+        };
+        let mut scene: Vec<unityfs::Node> = [
+            format!("level{n}"),
+            own.clone(),
+            "globalgamemanagers.assets".into(),
+        ]
+        .into_iter()
+        .filter_map(|name| {
+            let bytes = nodes.get(&name)?.clone();
+            Some(unityfs::Node { name, bytes })
+        })
+        .collect();
+        scene.extend(streamed);
+        match collection_art::scene_tiles(&scene) {
+            Ok((found, more)) => {
+                tiles.extend(found);
+                warnings.extend(more);
+            }
+            Err(err) => warnings.push(format!("map tiles of scene {n}: {err}")),
+        }
+    }
+    (tiles, warnings)
+}
+
+/// An art bundle's largest texture, and the sprites the bundle holds by serialized file and path ID
+pub fn art_rgb(bundle: &[u8]) -> Result<(image::RgbImage, Vec<(String, i64)>), String> {
+    let nodes = unityfs::decode(bundle)?;
+    let rgb = texture::texture_from_bundle(&nodes)?
+        .into_rgb()
+        .ok_or("unexpected texture layout")?;
+    let mut sprites = Vec::new();
+    for node in nodes.iter().filter(|n| !unityfs::is_resource(&n.name)) {
+        for object in serialized::objects(&node.bytes).unwrap_or_default() {
+            if object.class_id == unity::SPRITE {
+                sprites.push((node.name.clone(), object.path_id));
+            }
+        }
+    }
+    Ok((rgb, sprites))
+}
+
+/// Only the videos, the Collection and its art, into any directory: for trying a new APK
+pub fn export_game_extras(apk: &Path, output: &Path) -> Result<(usize, usize, usize), String> {
+    let (mut zip, names) = open_apk(apk)?;
+    let packed = read_packed(&mut zip, &names)?;
+    let jobs = bundle_jobs(&mut zip, &names)?;
+    let extras = export_extras(
+        &mut zip,
+        packed.as_deref(),
+        &jobs.videos,
+        &jobs.arts,
+        output,
+    );
+    if let Some(dir) = extras.keep.first() {
+        return Err(format!("{dir} was skipped"));
+    }
+    Ok((extras.clips, extras.collection, extras.arts))
 }
 
 /// Read an APK and write chart/, music/, illustration*/, avatar/, original_ill/ and info/ in their final
@@ -53,12 +400,12 @@ pub fn export(
     if legacy.exists() {
         fs::remove_dir_all(&legacy).map_err(|e| e.to_string())?;
     }
-    let file = File::open(apk).map_err(|e| e.to_string())?;
-    let mut zip = ZipArchive::new(file).map_err(|e| format!("apk is not a zip: {e}"))?;
-    let names: Vec<String> = zip.file_names().map(|s| s.to_string()).collect();
-    let level0 = read_level0(&mut zip, &names)?;
+    let (mut zip, names) = open_apk(apk)?;
+    let packed = read_packed(&mut zip, &names)?;
+    let level0 = read_level0(&mut zip, &names, packed.as_deref())?;
     let songs = gameinfo::parse_songs(&level0)?;
     let tips = gameinfo::parse_tips(&level0)?;
+    let tip_lists = gameinfo::parse_tip_lists(&level0)?;
     let avatars = gameinfo::parse_avatars(&level0)?;
     eprintln!(
         "level0: {} songs, {} tips, {} avatars",
@@ -70,6 +417,11 @@ pub fn export(
     fs::create_dir_all(&info).map_err(|e| e.to_string())?;
     write_json(&info.join("songs.json"), &gameinfo::songs_json(&songs))?;
     write_json(&info.join("tips.json"), &gameinfo::tips_json(&tips))?;
+    let tips_manifest = output.join(gameinfo::TIPS_MANIFEST);
+    if let Some(dir) = tips_manifest.parent() {
+        fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    write_json(&tips_manifest, &gameinfo::tip_lists_json(&tip_lists))?;
     write_json(
         &info.join("avatars.json"),
         &gameinfo::avatars_json(&avatars),
@@ -84,16 +436,17 @@ pub fn export(
         .map_err(|e| e.to_string())?,
     )?;
 
-    let catalog_name = names
-        .iter()
-        .find(|n| n.ends_with("aa/catalog.json"))
-        .cloned()
-        .ok_or("apk has no addressables catalog")?;
-    let catalog_bytes = read_zip(&mut zip, &catalog_name)?;
-    let catalog: Value = serde_json::from_slice(&catalog_bytes).map_err(|e| e.to_string())?;
-    drop(catalog_bytes);
-    let jobs = unique_outputs(catalog::jobs(&catalog)?);
-    drop(catalog);
+    let Jobs {
+        videos,
+        arts,
+        rest: jobs,
+    } = bundle_jobs(&mut zip, &names)?;
+    let extras = export_extras(&mut zip, packed.as_deref(), &videos, &arts, output);
+    drop(packed);
+    eprintln!(
+        "videos: {}, collection entries: {}, collection art: {}",
+        extras.clips, extras.collection, extras.arts
+    );
     let threads = par::threads();
     eprintln!("addressables: {} bundles on {threads} threads", jobs.len());
 
@@ -133,7 +486,8 @@ pub fn export(
                     .into_rgb()
                     .ok_or_else(|| ctx("unexpected texture layout".into()))?;
                 let name = dest
-                    .file_name()
+                    .strip_prefix(output.join("illustration"))
+                    .ok()
                     .and_then(|n| n.to_str())
                     .ok_or("jacket without a name")?;
                 paths.extend(jackets::derive(output, name, &rgb).map_err(ctx)?);
@@ -144,13 +498,27 @@ pub fn export(
             Want::Avatar { .. } => {
                 write_if_changed(&dest, &texture::png_from_bundle(&nodes).map_err(ctx)?)?;
             }
+            Want::Video { .. } => return Err(ctx("videos are exported separately".into())),
+            Want::CollectionArt { .. } => {
+                return Err(ctx("collection art is exported separately".into()))
+            }
         }
         written.lock().map_err(|e| e.to_string())?.extend(paths);
         Ok(())
     })?;
-    let written = written.into_inner().map_err(|e| e.to_string())?;
+    let mut written = written.into_inner().map_err(|e| e.to_string())?;
+    written.extend(extras.written);
+    // Which songs have a jacket per difficulty, for the web UI; under original_ill/, which is pruned
+    files::write_and_keep(
+        output.join(LEVELS_MANIFEST),
+        jacket_levels_json(&jobs)?.as_bytes(),
+        &mut written,
+    )?;
     let mut stale = 0;
     for dir in OWNED_DIRS {
+        if extras.keep.contains(&dir) {
+            continue;
+        }
         stale += files::prune(&output.join(dir), &written)?;
     }
     let stats = stats.into_inner().map_err(|e| e.to_string())?;
@@ -160,13 +528,38 @@ pub fn export(
     )?;
     let jackets = jobs
         .iter()
-        .filter(|j| matches!(j.want, Want::Jacket { .. }))
+        .filter(|j| matches!(j.want, Want::Jacket { level: None, .. }))
         .count();
     eprintln!("extract done; removed {stale} stale files");
     Ok(Exported {
         jackets,
         bundles: jobs.len(),
+        clips: extras.clips,
+        collection: extras.collection,
+        arts: extras.arts,
+        warnings: extras.warnings,
     })
+}
+
+fn jacket_levels_json(jobs: &[catalog::BundleJob]) -> Result<String, String> {
+    let mut songs: BTreeMap<String, Vec<&str>> = BTreeMap::new();
+    for job in jobs {
+        if let Want::Jacket {
+            folder,
+            level: Some(level),
+        } = &job.want
+        {
+            songs
+                .entry(song_id(folder).to_string())
+                .or_default()
+                .push(level.as_str());
+        }
+    }
+    for levels in songs.values_mut() {
+        levels.sort_by_key(|l| LEVELS.iter().position(|x| x == l));
+        levels.dedup();
+    }
+    serde_json::to_string(&serde_json::json!({ "v": 1, "songs": songs })).map_err(|e| e.to_string())
 }
 
 /// When two bundles map to one output file, keep the later one (the old serial loop overwrote earlier
@@ -188,10 +581,63 @@ fn write_json(path: &Path, value: &Value) -> Result<(), String> {
     write_if_changed(path, &body).map(|_| ())
 }
 
-fn read_level0(zip: &mut ZipArchive<File>, names: &[String]) -> Result<Vec<u8>, String> {
-    if names.iter().any(|n| n == "assets/bin/Data/data.unity3d") {
-        let packed = read_zip(zip, "assets/bin/Data/data.unity3d")?;
-        return unityfs::read_named(&packed, "level0");
+pub fn open_apk(apk: &Path) -> Result<(ZipArchive<File>, Vec<String>), String> {
+    let file = File::open(apk).map_err(|e| e.to_string())?;
+    let zip = ZipArchive::new(file).map_err(|e| format!("apk is not a zip: {e}"))?;
+    let names = zip.file_names().map(|s| s.to_string()).collect();
+    Ok((zip, names))
+}
+
+/// The addressable bundles to export: the videos and the collection art go to `export_extras`, the rest to the
+/// parallel extract
+#[derive(Default)]
+struct Jobs {
+    videos: Vec<catalog::BundleJob>,
+    arts: Vec<catalog::BundleJob>,
+    rest: Vec<catalog::BundleJob>,
+}
+
+/// The APK's addressables catalog
+pub fn read_catalog(zip: &mut ZipArchive<File>, names: &[String]) -> Result<Value, String> {
+    let catalog_name = names
+        .iter()
+        .find(|n| n.ends_with("aa/catalog.json"))
+        .ok_or("apk has no addressables catalog")?;
+    serde_json::from_slice(&read_zip(zip, catalog_name)?).map_err(|e| e.to_string())
+}
+
+fn bundle_jobs(zip: &mut ZipArchive<File>, names: &[String]) -> Result<Jobs, String> {
+    let catalog = read_catalog(zip, names)?;
+    let mut jobs = Jobs::default();
+    for job in unique_outputs(catalog::jobs(&catalog)?) {
+        match job.want {
+            Want::Video { .. } => jobs.videos.push(job),
+            Want::CollectionArt { .. } => jobs.arts.push(job),
+            _ => jobs.rest.push(job),
+        }
+    }
+    Ok(jobs)
+}
+
+/// `data.unity3d`, which holds every scene and level0, when the APK packs them
+pub fn read_packed(
+    zip: &mut ZipArchive<File>,
+    names: &[String],
+) -> Result<Option<Vec<u8>>, String> {
+    if names.iter().any(|n| n == PACKED_DATA) {
+        read_zip(zip, PACKED_DATA).map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
+fn read_level0(
+    zip: &mut ZipArchive<File>,
+    names: &[String],
+    packed: Option<&[u8]>,
+) -> Result<Vec<u8>, String> {
+    if let Some(packed) = packed {
+        return unityfs::read_named(packed, "level0");
     }
     let mut parts: Vec<&String> = names
         .iter()
@@ -215,7 +661,7 @@ fn split_ord(name: &str) -> u32 {
         .unwrap_or(0)
 }
 
-fn read_zip(zip: &mut ZipArchive<File>, name: &str) -> Result<Vec<u8>, String> {
+pub fn read_zip(zip: &mut ZipArchive<File>, name: &str) -> Result<Vec<u8>, String> {
     let mut file = zip
         .by_name(name)
         .map_err(|e| format!("missing {name}: {e}"))?;
@@ -280,7 +726,7 @@ struct NoteTime {
     hold_time: f64,
 }
 
-fn carve_chart(nodes: &[unityfs::Node]) -> Result<(Vec<u8>, NoteCounts), String> {
+pub fn carve_chart(nodes: &[unityfs::Node]) -> Result<(Vec<u8>, NoteCounts), String> {
     let needle = b"{\"formatVersion\"";
     for node in nodes {
         if let Some(rel) = find(&node.bytes, needle) {
@@ -301,7 +747,7 @@ fn carve_chart(nodes: &[unityfs::Node]) -> Result<(Vec<u8>, NoteCounts), String>
     Err("bundle has no chart json".into())
 }
 
-fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+pub fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     let first = *needle.first()?;
     let mut at = 0;
     while let Some(i) = haystack.get(at..)?.iter().position(|b| *b == first) {
@@ -420,6 +866,47 @@ pub fn notes_info_from_charts(output: &Path) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_skipped_part_keeps_its_old_output_and_is_reported() {
+        let mut extras = Extras::default();
+        extras.failed("pv", "no video clips");
+        extras.failed("collection", "no chapters in the SaturnOS scene");
+        extras.failed(collection_art::DIR, "no collection art");
+        assert_eq!(extras.keep, ["pv", "collection", "collection-art"]);
+        assert_eq!(
+            extras.warnings,
+            [
+                "pv skipped: no video clips",
+                "collection skipped: no chapters in the SaturnOS scene",
+                "collection-art skipped: no collection art"
+            ]
+        );
+        assert!(OWNED_DIRS.contains(&"collection-art"));
+    }
+
+    #[test]
+    fn lists_the_songs_with_a_jacket_per_difficulty() {
+        let job = |folder: &str, level: Option<&str>| catalog::BundleJob {
+            zip_path: String::new(),
+            want: Want::Jacket {
+                folder: folder.into(),
+                level: level.map(String::from),
+            },
+        };
+        let jobs = vec![
+            job("Song.A.0", Some("IN")),
+            job("Song.A.0", Some("EZ")),
+            job("Song.A.0", None),
+            job("Song.A.0", Some("AT")),
+            job("Plain.B.0", None),
+        ];
+        assert_eq!(
+            jacket_levels_json(&jobs).unwrap(),
+            r#"{"songs":{"Song.A":["EZ","IN","AT"]},"v":1}"#
+        );
+        assert_eq!(jacket_levels_json(&[]).unwrap(), r#"{"songs":{},"v":1}"#);
+    }
 
     #[test]
     fn carves_the_sample_chart() {

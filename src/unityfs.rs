@@ -242,11 +242,23 @@ pub fn read_named(data: &[u8], name: &str) -> Result<Vec<u8>, String> {
         .ok_or_else(|| "unityfs node past data".to_string())
 }
 
+/// Streamed data (`.resS`, `.resource`) beside a bundle's serialized files
+pub fn is_resource(name: &str) -> bool {
+    name.ends_with(".resS") || name.ends_with(".resource")
+}
+
 pub fn decode(data: &[u8]) -> Result<Vec<Node>, String> {
+    decode_where(data, |_| true)
+}
+
+pub fn decode_where(data: &[u8], keep: impl Fn(&str) -> bool) -> Result<Vec<Node>, String> {
     let archive = parse_archive(data)?;
     let raw = inflate_until(data, &archive, 0)?;
-    let mut out = Vec::with_capacity(archive.nodes.len());
+    let mut out = Vec::new();
     for (name, off, sz) in archive.nodes {
+        if !keep(&name) {
+            continue;
+        }
         let end = off.checked_add(sz).ok_or("unityfs node size")?;
         let bytes = raw.get(off..end).ok_or("unityfs node past data")?.to_vec();
         out.push(Node { name, bytes });

@@ -1,6 +1,7 @@
 use crate::cursor::Cursor;
 use crate::serialized::{self, AssetObject};
-use crate::unityfs::Node;
+use crate::unityfs::{self, Node};
+use image::codecs::jpeg::JpegEncoder;
 use image::codecs::png::PngEncoder;
 use image::{ColorType, ImageEncoder, RgbImage};
 use std::io::Cursor as IoCursor;
@@ -13,7 +14,7 @@ pub fn png_from_bundle(nodes: &[Node]) -> Result<Vec<u8>, String> {
 pub fn texture_from_bundle(nodes: &[Node]) -> Result<Texture, String> {
     let cab = nodes
         .iter()
-        .find(|n| !n.name.ends_with(".resS") && !n.name.ends_with(".resource"))
+        .find(|n| !unityfs::is_resource(&n.name))
         .ok_or("bundle has no serialized file")?;
     let objects = serialized::objects(&cab.bytes)?;
     let mut best: Option<Texture> = None;
@@ -44,6 +45,23 @@ pub fn encode_png(tex: &Texture) -> Result<Vec<u8>, String> {
     Ok(png)
 }
 
+pub fn encode_rgb_png(img: &RgbImage) -> Result<Vec<u8>, String> {
+    let mut png = Vec::new();
+    PngEncoder::new(&mut png)
+        .write_image(img.as_raw(), img.width(), img.height(), ColorType::Rgb8)
+        .map_err(|e| e.to_string())?;
+    Ok(png)
+}
+
+/// Baseline JPEG; the same pixels at the same quality give the same bytes
+pub fn encode_rgb_jpeg(img: &RgbImage, quality: u8) -> Result<Vec<u8>, String> {
+    let mut jpeg = Vec::new();
+    JpegEncoder::new_with_quality(&mut jpeg, quality)
+        .write_image(img.as_raw(), img.width(), img.height(), ColorType::Rgb8)
+        .map_err(|e| e.to_string())?;
+    Ok(jpeg)
+}
+
 pub struct Texture {
     pub width: u32,
     pub height: u32,
@@ -67,9 +85,16 @@ impl Texture {
     }
 }
 
+/// One Texture2D object, decoded; `nodes` hold its streamed data
+pub fn texture_object(body: &[u8], nodes: &[Node]) -> Result<Texture, String> {
+    read_body(body, nodes).ok_or_else(|| "unreadable texture".into())
+}
+
 fn read_texture(file: &[u8], object: &AssetObject, nodes: &[Node]) -> Option<Texture> {
-    let end = object.start.checked_add(object.size)?;
-    let body = file.get(object.start..end)?;
+    read_body(object.bytes(file)?, nodes)
+}
+
+fn read_body(body: &[u8], nodes: &[Node]) -> Option<Texture> {
     let mut r = Cursor::new(body);
     let _name = r.string().ok()?;
     let _fallback = r.i32().ok()?;
@@ -146,6 +171,19 @@ fn read_texture(file: &[u8], object: &AssetObject, nodes: &[Node]) -> Option<Tex
             flip_rows(&mut pixels, width as u32, height as u32, 4);
             (ColorType::Rgba8, pixels)
         }
+        // RGBAHalf: four 16-bit floats per pixel
+        17 => {
+            let need = width as usize * height as usize * 8;
+            if raw.len() < need {
+                return None;
+            }
+            let mut pixels: Vec<u8> = raw[..need]
+                .chunks_exact(2)
+                .map(|h| unit_byte(half_to_f32(u16::from_le_bytes([h[0], h[1]]))))
+                .collect();
+            flip_rows(&mut pixels, width as u32, height as u32, 4);
+            (ColorType::Rgba8, pixels)
+        }
         34 => {
             let rgb = decode_etc1(raw, width as u32, height as u32).ok()?;
             (ColorType::Rgb8, rgb)
@@ -166,6 +204,21 @@ fn read_texture(file: &[u8], object: &AssetObject, nodes: &[Node]) -> Option<Tex
         pixels,
         color,
     })
+}
+
+fn half_to_f32(h: u16) -> f32 {
+    let sign = if h & 0x8000 != 0 { -1.0 } else { 1.0 };
+    let exp = i32::from((h >> 10) & 0x1f);
+    let frac = f32::from(h & 0x3ff);
+    sign * match exp {
+        0 => frac * 2f32.powi(-24),
+        31 => f32::INFINITY,
+        _ => (1.0 + frac / 1024.0) * 2f32.powi(exp - 15),
+    }
+}
+
+fn unit_byte(v: f32) -> u8 {
+    (v.clamp(0.0, 1.0) * 255.0).round() as u8
 }
 
 fn flip_rows(pixels: &mut [u8], width: u32, height: u32, bpp: usize) {
@@ -411,23 +464,23 @@ fn decode_etc1_block(block: &[u8]) -> [[u8; 3]; 16] {
     out
 }
 
+/// The 3-bit indices are stored most significant first, column by column
 fn decode_eac_alpha(block: &[u8]) -> [u8; 16] {
     let base = block[0] as i32;
     let multiplier = (block[1] >> 4) as i32;
     let table = (block[1] & 0x0f) as usize;
-    let mut bits = 0u64;
-    for (i, byte) in block[2..8].iter().enumerate() {
-        bits |= (*byte as u64) << (8 * i);
-    }
+    let bits = block[2..8]
+        .iter()
+        .fold(0u64, |bits, byte| (bits << 8) | *byte as u64);
     let mut out = [0u8; 16];
-    for (i, slot) in out.iter_mut().enumerate() {
-        let index = ((bits >> (3 * i)) & 7) as usize;
-        let value = base + EAC_MOD[table][index] * multiplier;
-        *slot = value.clamp(0, 255) as u8;
+    for k in 0..16 {
+        let index = ((bits >> (45 - 3 * k)) & 7) as usize;
+        out[(k % 4) * 4 + k / 4] = (base + EAC_MOD[table][index] * multiplier).clamp(0, 255) as u8;
     }
     out
 }
 
+/// `rgba` is false for ETC2 RGB, true for ETC2 RGBA8
 fn decode_etc2_color(data: &[u8], width: u32, height: u32, rgba: bool) -> Result<Vec<u8>, String> {
     if !width.is_multiple_of(4) || !height.is_multiple_of(4) {
         return Err("etc2 size".into());
@@ -574,6 +627,85 @@ mod tests {
     use crate::unityfs;
 
     #[test]
+    fn encodes_rgb_the_same_way_every_time() {
+        let img = RgbImage::from_fn(64, 18, |x, y| {
+            image::Rgb([(x * 4) as u8, (y * 14) as u8, ((x + y) * 3) as u8])
+        });
+        let jpeg = encode_rgb_jpeg(&img, 85).unwrap();
+        assert_eq!(jpeg, encode_rgb_jpeg(&img, 85).unwrap());
+        // SOF0: baseline, not progressive
+        assert!(jpeg.windows(2).any(|w| w == [0xFF, 0xC0]));
+        let back = image::load_from_memory(&jpeg).unwrap();
+        assert_eq!((back.width(), back.height()), (64, 18));
+        let png = encode_rgb_png(&img).unwrap();
+        assert_eq!(image::load_from_memory(&png).unwrap().to_rgb8(), img);
+    }
+
+    /// Base 100, multiplier 1, table 13 (-1 -2 -3 -10 0 1 2 9): index 4 (+0) everywhere except the first pixel of the
+    /// first column (index 7, +9) and the first pixel of the second column (index 0, -1)
+    fn alpha_block() -> Vec<u8> {
+        let mut bits = 0u64;
+        for k in 0..16 {
+            let index = match k {
+                0 => 7,
+                4 => 0,
+                _ => 4,
+            };
+            bits |= index << (45 - 3 * k);
+        }
+        let mut block = vec![100, 0x1d];
+        block.extend(&bits.to_be_bytes()[2..]);
+        block
+    }
+
+    #[test]
+    fn reads_eac_alpha_indices_most_significant_first_by_column() {
+        let alpha = decode_eac_alpha(&alpha_block());
+        assert_eq!(alpha[0], 109);
+        assert_eq!(alpha[1], 99);
+        assert!(alpha[2..].iter().all(|a| *a == 100));
+        assert_eq!(alpha[4], 100);
+    }
+
+    /// A 4x4 ETC2 RGBA8 Texture2D holding one block, its pixels inline
+    fn etc2_rgba_body(block: &[u8]) -> Vec<u8> {
+        let mut b = Vec::new();
+        for v in [0i32, 0, 0, 4, 4, 16, 0, 47, 1, 0] {
+            b.extend(v.to_le_bytes());
+        }
+        b.extend([0u8; 44]);
+        b.extend(0i32.to_le_bytes());
+        b.extend((block.len() as i32).to_le_bytes());
+        b.extend(block);
+        b.extend(0u64.to_le_bytes());
+        b.extend(0u32.to_le_bytes());
+        b.extend(0i32.to_le_bytes());
+        b
+    }
+
+    #[test]
+    fn bundled_and_referenced_textures_both_read_etc2_alpha_as_the_format_stores_it() {
+        let mut pixels = alpha_block();
+        pixels.extend([0u8; 8]);
+        let body = etc2_rgba_body(&pixels);
+        let alpha = |tex: Texture| -> Vec<u8> {
+            assert_eq!((tex.width, tex.height, tex.color), (4, 4, ColorType::Rgba8));
+            tex.pixels.chunks_exact(4).map(|p| p[3]).collect()
+        };
+        let object = AssetObject {
+            path_id: 1,
+            class_id: 28,
+            start: 0,
+            size: body.len(),
+        };
+        // Rows come out top-down, the block's first row last
+        let mut want = vec![100u8; 12];
+        want.extend([109, 99, 100, 100]);
+        assert_eq!(alpha(read_texture(&body, &object, &[]).unwrap()), want);
+        assert_eq!(alpha(texture_object(&body, &[]).unwrap()), want);
+    }
+
+    #[test]
     fn decodes_the_sample_illustration() {
         let path = "/tmp/ill.bundle";
         if !std::path::Path::new(path).exists() {
@@ -639,5 +771,16 @@ mod tests {
             let mean = diff as f64 / (got.width() * got.height() * 3) as f64;
             assert!(mean < 2.0, "etc2 mean abs {mean}");
         }
+    }
+
+    #[test]
+    fn reads_half_float_pixels() {
+        assert_eq!(half_to_f32(0x3c00), 1.0);
+        assert_eq!(half_to_f32(0x3800), 0.5);
+        assert_eq!(half_to_f32(0x0000), 0.0);
+        assert_eq!(half_to_f32(0xbc00), -1.0);
+        assert_eq!(unit_byte(half_to_f32(0x3800)), 128);
+        assert_eq!(unit_byte(2.0), 255);
+        assert_eq!(unit_byte(-1.0), 0);
     }
 }

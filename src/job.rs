@@ -25,15 +25,15 @@ pub struct State {
     pub songs: u64,
     pub pez: u64,
     pub jackets: u64,
+    pub pv: u64,
+    pub collection: u64,
+    pub collection_art: u64,
+    pub warnings: Vec<String>,
     pub error: String,
     pub updated_at: String,
-    /// Runs of `version_code` since it last succeeded, including the latest one. 0 after a success
     pub attempts: u32,
-    /// Unix seconds when the latest run started
     pub started_at: u64,
-    /// Unix seconds when the latest run ended, ok or not; 0 while it runs (or if it died running)
     pub finished_at: u64,
-    /// Last step the latest run reached: preflight, download, extract, pez, publish, mirror, done
     pub stage: String,
 }
 
@@ -144,6 +144,9 @@ pub fn unpack(
         ..State::default()
     };
     write_state(paths, &state)?;
+    if prev.status == "ok" && prev.version_code != apk.version_code {
+        archive_apk(paths, &prev.version_name);
+    }
     let result = catch_unwind(AssertUnwindSafe(|| run(paths, &apk, &mut state)))
         .unwrap_or_else(|panic| Err(format!("panicked: {}", par::panic_message(&*panic))));
     state.finished_at = now_secs();
@@ -188,15 +191,49 @@ fn run(paths: &Paths, apk: &Apk, state: &mut State) -> Result<(), String> {
     let output = paths.output();
     let exported = extract::export(&apk_path, &output, &apk.version_code, &apk.version_name)?;
     state.jackets = exported.jackets as u64;
+    state.pv = exported.clips as u64;
+    state.collection = exported.collection as u64;
+    state.collection_art = exported.arts as u64;
+    state.warnings = exported.warnings;
     state.songs = write_info_tsv(&output)? as u64;
     enter(state, "pez")?;
     state.pez = pack_all(&output)? as u64;
     enter(state, "publish")?;
-    publish(&output, &paths.manifest(), false)?;
+    let (_, warnings) = publish(&output, &paths.manifest(), false)?;
+    state.warnings.extend(warnings);
     enter(state, "mirror")?;
     mirror(&output)?;
     eprintln!("[{:>6.1}s] done", started.elapsed().as_secs_f64());
     Ok(())
+}
+
+/// Keep the APK a new version is about to replace: `<archive>/Phigros_<version>.apk`, a hard link when it can be.
+/// What the game drops then stays recoverable (removed songs and charts are taken from these). The archive is
+/// UNPACK_APK_ARCHIVE, else `apk/archive` under the root. A failure only warns: it must not hold up the new version
+fn archive_apk(paths: &Paths, version_name: &str) {
+    let name: String = version_name
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '-')
+        .collect();
+    let apk = paths.root.join("apk/game.apk");
+    if name.is_empty() || !apk.is_file() {
+        return;
+    }
+    let dir = std::env::var("UNPACK_APK_ARCHIVE")
+        .ok()
+        .filter(|d| !d.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| paths.root.join("apk/archive"));
+    let dest = dir.join(format!("Phigros_{name}.apk"));
+    if dest.exists() {
+        return;
+    }
+    let kept = fs::create_dir_all(&dir)
+        .and_then(|()| fs::hard_link(&apk, &dest).or_else(|_| fs::copy(&apk, &dest).map(|_| ())));
+    match kept {
+        Ok(()) => eprintln!("archive: kept {version_name} as {}", dest.display()),
+        Err(err) => eprintln!("archive: {version_name} not kept: {err}"),
+    }
 }
 
 pub fn now_secs() -> u64 {
@@ -311,6 +348,30 @@ fn mirror(output: &Path) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn archive_keeps_the_outgoing_apk_once() {
+        let root = std::env::temp_dir().join(format!("phi-archive-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("apk")).unwrap();
+        fs::write(root.join("apk/game.apk"), b"4.0.1 bytes").unwrap();
+        let paths = Paths { root: root.clone() };
+        archive_apk(&paths, "4.0.1");
+        let kept = root.join("apk/archive/Phigros_4.0.1.apk");
+        assert_eq!(fs::read(&kept).unwrap(), b"4.0.1 bytes");
+        // download() renames the new file into place, so the hard link keeps the old bytes
+        fs::write(root.join("apk/game.apk.part"), b"newer").unwrap();
+        fs::rename(root.join("apk/game.apk.part"), root.join("apk/game.apk")).unwrap();
+        archive_apk(&paths, "4.0.1");
+        assert_eq!(
+            fs::read(&kept).unwrap(),
+            b"4.0.1 bytes",
+            "an archived version is never overwritten"
+        );
+        archive_apk(&paths, "../x");
+        assert!(root.join("apk/archive/Phigros_..x.apk").exists() || !root.join("x").exists());
+        let _ = fs::remove_dir_all(&root);
+    }
     use super::*;
 
     #[test]
@@ -350,6 +411,21 @@ mod tests {
             ("error", 0, 0)
         );
         assert_eq!(retry_at(&state, "140"), None);
+        assert!(state.warnings.is_empty());
+    }
+
+    #[test]
+    fn warnings_are_saved_with_the_state_and_start_empty_each_run() {
+        let state = State {
+            status: "ok".into(),
+            warnings: vec!["pv skipped: no video clips".into()],
+            ..State::default()
+        };
+        let saved = serde_json::to_string(&state).unwrap();
+        assert!(saved.contains("\"warnings\":[\"pv skipped: no video clips\"]"));
+        let back: State = serde_json::from_str(&saved).unwrap();
+        assert_eq!(back.warnings, state.warnings);
+        assert!(State::default().warnings.is_empty());
     }
 
     /// Serves `body` over plain HTTP on 127.0.0.1, one connection per request. The first request

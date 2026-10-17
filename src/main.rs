@@ -28,6 +28,24 @@ struct Req {
 }
 
 fn main() {
+    // --extras <apk> <dir>: only the videos, the Collection and its art; touches no UNPACK_ROOT and uploads nothing
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(at) = args.iter().position(|arg| arg == "--extras") {
+        let (Some(apk), Some(out)) = (args.get(at + 1), args.get(at + 2)) else {
+            eprintln!("usage: phi-unpackd --extras <apk> <output dir>");
+            std::process::exit(2);
+        };
+        match phi_unpackd::extract::export_game_extras(apk.as_ref(), out.as_ref()) {
+            Ok((clips, entries, arts)) => {
+                println!("videos {clips} collection entries {entries} collection art {arts}")
+            }
+            Err(err) => {
+                eprintln!("extras failed: {err}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
     if std::env::args().any(|arg| arg == "--unpack") {
         let paths = Paths::from_env();
         let lock = match paths.try_lock() {
@@ -54,6 +72,9 @@ fn main() {
                     "ok version {} songs {} jackets {} pez {}",
                     state.version_name, state.songs, state.jackets, state.pez
                 );
+                for warning in &state.warnings {
+                    println!("warning: {warning}");
+                }
             }
             Ok(None) => println!("skipped"),
             Err(err) => {
@@ -78,8 +99,11 @@ fn main() {
         };
         // notesInfo.json is rebuilt from the charts on disk, in case an extract stopped part way
         match phi_unpackd::publish::publish(&paths.output(), &paths.manifest(), true) {
-            Ok(n) => {
+            Ok((n, warnings)) => {
                 println!("uploaded {n}");
+                for warning in warnings {
+                    println!("warning: {warning}");
+                }
                 return;
             }
             Err(err) => {

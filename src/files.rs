@@ -19,6 +19,16 @@ pub fn write_if_changed(path: &Path, bytes: &[u8]) -> Result<bool, String> {
     Ok(true)
 }
 
+pub fn write_and_keep(
+    path: PathBuf,
+    bytes: &[u8],
+    keep: &mut HashSet<PathBuf>,
+) -> Result<(), String> {
+    write_if_changed(&path, bytes)?;
+    keep.insert(path);
+    Ok(())
+}
+
 /// Make `dest` hold the same bytes as `src`: a hard link where the filesystem allows, else a copy
 /// A `dest` that is a separate copy (written by older builds) is replaced by a link, so its disk space
 /// is reclaimed and later runs need only compare inodes. Without hard links, an identical copy is left

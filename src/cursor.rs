@@ -48,6 +48,10 @@ impl<'a> Cursor<'a> {
         Ok(u64::from_le_bytes(b.try_into().unwrap()))
     }
 
+    pub fn i64(&mut self) -> Result<i64, String> {
+        Ok(self.u64()? as i64)
+    }
+
     pub fn f32(&mut self) -> Result<f32, String> {
         Ok(f32::from_le_bytes(self.u32()?.to_le_bytes()))
     }

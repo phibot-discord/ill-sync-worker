@@ -1,5 +1,8 @@
 use crate::files::{self, write_if_changed};
+use crate::layout::{fmt_diff, song_id, text};
 use crate::par;
+use serde_json::Value;
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs;
 use std::io::{Cursor, Read, Write};
@@ -112,8 +115,10 @@ struct Song {
     difficulty: [String; 4],
 }
 
-/// One `phira/<LEVEL>/<id>-<LEVEL>.pez` per charted level, packed in parallel. Packs for songs or
-/// levels that no longer exist are removed
+/// One `phira/<LEVEL>/<id>-<LEVEL>.pez` per chart extract wrote (`chart/<id>.0/<LEVEL>.json`), packed in
+/// parallel. A level the song table lists takes its difficulty and charter (EZ to AT from `info.tsv`, any other,
+/// such as Legacy, from `songs.json`); one it does not list is `Lv.?` with no charter (an unlock's chart), except EZ
+/// to AT, which the game does not offer then. Packs for songs or levels that no longer exist are removed
 pub fn pack_all(output: &Path) -> Result<usize, String> {
     let info = fs::read_to_string(output.join("info/info.tsv")).map_err(|e| e.to_string())?;
     let difficulty =
@@ -134,6 +139,29 @@ pub fn pack_all(output: &Path) -> Result<usize, String> {
                 [c[8].into(), c[9].into(), c[10].into(), c[11].into()],
             ),
         );
+    }
+    // Levels beyond EZ to AT, by song and level: difficulty and charter as info.tsv writes them
+    let mut other = HashMap::<String, HashMap<String, (String, String)>>::new();
+    let listed: Value = serde_json::from_slice(
+        &fs::read(output.join("info/songs.json")).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    for song in listed.as_array().map(Vec::as_slice).unwrap_or_default() {
+        let Some(levels) = song["levels"].as_object() else {
+            continue;
+        };
+        let levels = levels
+            .iter()
+            .filter(|(level, _)| !LEVELS.contains(&level.as_str()))
+            .map(|(level, entry)| {
+                (
+                    level.clone(),
+                    (fmt_diff(&entry["difficulty"]), text(&entry["charter"])),
+                )
+            })
+            .filter(|(_, (difficulty, _))| !difficulty.is_empty())
+            .collect();
+        other.insert(song_id(&text(&song["id"])).to_string(), levels);
     }
     let mut diffs = std::collections::BTreeMap::<String, [String; 4]>::new();
     for line in difficulty.lines().skip(1) {
@@ -175,23 +203,35 @@ pub fn pack_all(output: &Path) -> Result<usize, String> {
             }
             let picture = fs::read(&picture_path).map_err(|e| e.to_string())?;
             let audio = fs::read(&song_path).map_err(|e| e.to_string())?;
-            for (i, level) in LEVELS.iter().enumerate() {
-                if song.difficulty[i].is_empty() {
-                    continue;
-                }
+            let mut levels: Vec<String> = match fs::read_dir(output.join(format!("chart/{id}.0"))) {
+                Ok(dir) => dir
+                    .filter_map(|entry| {
+                        let name = entry.ok()?.file_name().into_string().ok()?;
+                        Some(name.strip_suffix(".json")?.to_string())
+                    })
+                    .collect(),
+                Err(_) => return Ok(()),
+            };
+            levels.sort();
+            for level in &levels {
+                let (difficulty, charter) = match LEVELS.iter().position(|l| l == level) {
+                    Some(i) if song.difficulty[i].is_empty() => continue,
+                    Some(i) => (song.difficulty[i].as_str(), song.charters[i].as_str()),
+                    None => match other.get(id).and_then(|levels| levels.get(level)) {
+                        Some((difficulty, charter)) => (difficulty.as_str(), charter.as_str()),
+                        None => ("?", ""),
+                    },
+                };
                 let chart_path = output.join(format!("chart/{id}.0/{level}.json"));
-                if !chart_path.is_file() {
-                    continue;
-                }
                 let chart = fs::read(&chart_path).map_err(|e| e.to_string())?;
                 let text = info_text(
                     id,
                     &song.name,
-                    level,
-                    &song.difficulty[i],
+                    &level.replace('_', " "),
+                    difficulty,
                     &song.composer,
                     &song.illustrator,
-                    &song.charters[i],
+                    charter,
                 );
                 let path = output.join(format!("phira/{level}/{id}-{level}.pez"));
                 pack_one(&path, id, &text, &chart, &picture, &audio)?;
@@ -211,6 +251,100 @@ pub fn pack_all(output: &Path) -> Result<usize, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn packs_every_charted_level_with_its_songs_music_and_picture() {
+        let dir = std::env::temp_dir().join(format!("phi-pez-unlock-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let write = |rel: &str, body: &[u8]| {
+            let path = dir.join(rel);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, body).unwrap();
+        };
+        write(
+            "info/info.tsv",
+            concat!(
+                "id\tsong\tcomposer\tillustrator\tEZ\tHD\tIN\tAT\tEZC\tHDC\tINC\tATC\n",
+                "Message.くるぶっこちゃん\tMessage\tくるぶっこちゃん\t神居冰绘 feat. 祈莲\t3.0\t13.2\t15.6\t16.5\ta\tb\tc\td\n",
+                "望影の方舟Six.SeURa\t望影の方舟Six\tSe-U-Ra\t鲸弑\t6.5\t11.9\t15.9\t\tTraveler\tTraveler\tKnight\t\n",
+            )
+            .as_bytes(),
+        );
+        write(
+            "info/songs.json",
+            r#"[{"id":"Message.くるぶっこちゃん.0","levels":{"IN":{"charter":"c","difficulty":15.6}}},{"id":"望影の方舟Six.SeURa.0","levels":{"EZ":{"charter":"Traveler","difficulty":6.5},"Legacy":{"charter":" Old ","difficulty":15}}}]"#
+                .as_bytes(),
+        );
+        write(
+            "info/difficulty.tsv",
+            "id\tEZ\tHD\tIN\tAT\nMessage.くるぶっこちゃん\t3.0\t13.2\t15.6\t16.5\n望影の方舟Six.SeURa\t6.5\t11.9\t15.9\t\n"
+                .as_bytes(),
+        );
+        for id in ["Message.くるぶっこちゃん", "望影の方舟Six.SeURa"] {
+            write(&format!("illustrationLowRes/{id}.png"), b"png");
+            write(&format!("music/{id}.ogg"), b"ogg");
+        }
+        for (rel, chart) in [
+            ("Message.くるぶっこちゃん.0/IN.json", "in"),
+            ("Message.くるぶっこちゃん.0/SP.json", "sp"),
+            ("望影の方舟Six.SeURa.0/EZ.json", "ez"),
+            ("望影の方舟Six.SeURa.0/EZ_Error.json", "ez error"),
+            ("望影の方舟Six.SeURa.0/IN_Error.json", "in error"),
+            ("望影の方舟Six.SeURa.0/Legacy.json", "legacy"),
+        ] {
+            write(&format!("chart/{rel}"), chart.as_bytes());
+        }
+        write("phira/SP/Gone-SP.pez", b"old");
+        assert_eq!(pack_all(&dir).unwrap(), 6);
+        let read = |rel: &str| {
+            let mut zip = ZipArchive::new(fs::File::open(dir.join(rel)).unwrap()).unwrap();
+            let mut entries = Vec::new();
+            for i in 0..zip.len() {
+                let mut file = zip.by_index(i).unwrap();
+                let mut body = String::new();
+                file.read_to_string(&mut body).unwrap();
+                entries.push((file.name().to_string(), body));
+            }
+            entries
+        };
+        let sp = read("phira/SP/Message.くるぶっこちゃん-SP.pez");
+        assert_eq!(
+            sp,
+            [
+                (
+                    "info.txt".to_string(),
+                    "#\nName: Message\nSong: Message.くるぶっこちゃん.ogg\nPicture: Message.くるぶっこちゃん.png\nChart: Message.くるぶっこちゃん.json\nLevel: SP Lv.?\nComposer: くるぶっこちゃん\nIllustrator: 神居冰绘 feat. 祈莲\nCharter: ".to_string()
+                ),
+                ("Message.くるぶっこちゃん.json".to_string(), "sp".to_string()),
+                ("Message.くるぶっこちゃん.png".to_string(), "png".to_string()),
+                ("Message.くるぶっこちゃん.ogg".to_string(), "ogg".to_string()),
+            ]
+        );
+        let error = read("phira/EZ_Error/望影の方舟Six.SeURa-EZ_Error.pez");
+        assert_eq!(
+            error[0].1,
+            "#\nName: 望影の方舟Six\nSong: 望影の方舟Six.SeURa.ogg\nPicture: 望影の方舟Six.SeURa.png\nChart: 望影の方舟Six.SeURa.json\nLevel: EZ Error Lv.?\nComposer: Se-U-Ra\nIllustrator: 鲸弑\nCharter: "
+        );
+        assert_eq!(error[1].1, "ez error");
+        assert_eq!(
+            read("phira/IN_Error/望影の方舟Six.SeURa-IN_Error.pez")[1].1,
+            "in error"
+        );
+        let ez = read("phira/EZ/望影の方舟Six.SeURa-EZ.pez");
+        assert!(ez[0].1.contains("\nLevel: EZ Lv.6.5\n"), "{}", ez[0].1);
+        assert!(ez[0].1.ends_with("\nCharter: Traveler"), "{}", ez[0].1);
+        assert_eq!(ez[1].1, "ez");
+        assert!(dir
+            .join("phira/IN/Message.くるぶっこちゃん-IN.pez")
+            .is_file());
+        assert!(!dir.join("phira/SP/Gone-SP.pez").exists());
+        assert!(read("phira/Legacy/望影の方舟Six.SeURa-Legacy.pez")[0]
+            .1
+            .ends_with(
+                "\nLevel: Legacy Lv.15.0\nComposer: Se-U-Ra\nIllustrator: 鲸弑\nCharter: Old"
+            ));
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn repacks_only_when_an_entry_changes() {

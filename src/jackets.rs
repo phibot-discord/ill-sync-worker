@@ -1,9 +1,9 @@
 use crate::files::{link_or_copy, write_if_changed};
 use crate::layout::list_pngs;
 use crate::par;
-use image::codecs::png::PngEncoder;
+use crate::texture::encode_rgb_png;
 use image::imageops::{blur, crop_imm, resize, FilterType};
-use image::{ColorType, ImageEncoder, RgbImage};
+use image::RgbImage;
 use std::path::{Path, PathBuf};
 
 const LOW_EDGE: u32 = 640;
@@ -14,17 +14,19 @@ const BLUR_SIGMA: f32 = 10.0;
 const BLUR_WORK_EDGE: u32 = 450;
 const BLUR_DIM: f32 = 0.62;
 
-/// Derive low-res and blur images for every `illustration/*.png` (used when only the full images exist;
+/// Derive low-res and blur images for every `illustration/**/*.png` (used when only the full images exist;
 /// extract derives them straight from the decoded texture)
 pub fn make_jackets(output: &Path) -> Result<usize, String> {
-    let pngs = list_pngs(&output.join("illustration"));
+    let root = output.join("illustration");
+    let pngs = list_pngs(&root);
     par::for_each(
         &pngs,
         par::threads(),
         || Ok(()),
         |_, _, src| {
             let name = src
-                .file_name()
+                .strip_prefix(&root)
+                .ok()
                 .and_then(|n| n.to_str())
                 .ok_or("jacket without a name")?;
             let img = image::open(src)
@@ -38,15 +40,16 @@ pub fn make_jackets(output: &Path) -> Result<usize, String> {
 
 /// Write `illustrationLowRes/<name>` (at most 640 px) and `illustrationBlur/<name>` (dimmed 1800 px
 /// cover) from the full image already at `illustration/<name>`, and link all three under `original_ill/`
-/// Returns every path it wrote or linked
+/// `name` is relative to those directories (`IN/<id>.png` for a per-difficulty jacket), so the levels
+/// of one song never share an output. Returns every path it wrote or linked
 pub fn derive(output: &Path, name: &str, img: &RgbImage) -> Result<Vec<PathBuf>, String> {
     let full = output.join("illustration").join(name);
     let low = output.join("illustrationLowRes").join(name);
     let blurred = output.join("illustrationBlur").join(name);
-    write_if_changed(&low, &encode(&fit_inside(img, LOW_EDGE))?)?;
+    write_if_changed(&low, &encode_rgb_png(&fit_inside(img, LOW_EDGE))?)?;
     let mut cover = blurred_cover(img, BLUR_EDGE);
     dim(&mut cover, BLUR_DIM);
-    write_if_changed(&blurred, &encode(&cover)?)?;
+    write_if_changed(&blurred, &encode_rgb_png(&cover)?)?;
     let mut written = Vec::with_capacity(5);
     for (src, web) in [(full, "ill"), (low, "illLow"), (blurred, "illBlur")] {
         let dest = output.join("original_ill").join(web).join(name);
@@ -92,12 +95,4 @@ fn dim(img: &mut RgbImage, factor: f32) {
     for c in img.iter_mut() {
         *c = table[*c as usize];
     }
-}
-
-fn encode(img: &RgbImage) -> Result<Vec<u8>, String> {
-    let mut png = Vec::new();
-    PngEncoder::new(&mut png)
-        .write_image(img.as_raw(), img.width(), img.height(), ColorType::Rgb8)
-        .map_err(|e| e.to_string())?;
-    Ok(png)
 }
