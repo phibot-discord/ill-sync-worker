@@ -15,6 +15,8 @@ use std::time::{Duration, Instant};
 const RETRY_BASE_SECS: u64 = 600;
 const RETRY_MAX_SECS: u64 = 6 * 3600;
 const DOWNLOAD_ATTEMPTS: u32 = 5;
+/// Runs a replaced build gets before it is left in the archive unpublished
+const PENDING_ATTEMPTS: u32 = 3;
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -35,6 +37,17 @@ pub struct State {
     pub started_at: u64,
     pub finished_at: u64,
     pub stage: String,
+    pub pending: Vec<Pending>,
+}
+
+/// A build TapTap replaced before its run succeeded. Its APK is kept, and it is published before any newer build
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Pending {
+    pub code: String,
+    pub name: String,
+    pub apk: String,
+    pub attempts: u32,
 }
 
 pub struct Paths {
@@ -141,12 +154,14 @@ pub fn unpack(
             1
         },
         started_at: now_secs(),
+        pending: prev.pending.clone(),
         ..State::default()
     };
-    write_state(paths, &state)?;
-    if prev.status == "ok" && prev.version_code != apk.version_code {
-        archive_apk(paths, &prev.version_name);
+    if !prev.version_code.is_empty() && prev.version_code != apk.version_code {
+        let kept = archive_apk(paths, &prev.version_name, &prev.version_code);
+        queue_replaced(&prev, kept, &mut state.pending);
     }
+    write_state(paths, &state)?;
     let result = catch_unwind(AssertUnwindSafe(|| run(paths, &apk, &mut state)))
         .unwrap_or_else(|panic| Err(format!("panicked: {}", par::panic_message(&*panic))));
     state.finished_at = now_secs();
@@ -179,6 +194,50 @@ fn run(paths: &Paths, apk: &Apk, state: &mut State) -> Result<(), String> {
     enter(state, "preflight")?;
     // Publishing is the last step; find missing credentials before spending minutes on the APK
     publish::check_env()?;
+    let mut notes = Vec::new();
+    let code_of = |code: &str| code.parse::<u64>().unwrap_or(u64::MAX);
+    let mut older: Vec<Pending> = state
+        .pending
+        .iter()
+        .filter(|p| code_of(&p.code) < code_of(&apk.version_code))
+        .cloned()
+        .collect();
+    older.sort_by_key(|p| code_of(&p.code));
+    for build in older {
+        eprintln!(
+            "pending: {} ({}) first, from {}",
+            build.name, build.code, build.apk
+        );
+        match publish_build(
+            paths,
+            Path::new(&build.apk),
+            &build.code,
+            &build.name,
+            state,
+            &enter,
+        ) {
+            Ok(()) => {
+                state.pending.retain(|p| p.code != build.code);
+                eprintln!("pending: published {} ({})", build.name, build.code);
+            }
+            Err(err) => {
+                let tries = build.attempts + 1;
+                if tries < PENDING_ATTEMPTS {
+                    if let Some(p) = state.pending.iter_mut().find(|p| p.code == build.code) {
+                        p.attempts = tries;
+                    }
+                    write_state(paths, state)?;
+                    return Err(format!("pending {} ({}): {err}", build.name, build.code));
+                }
+                state.pending.retain(|p| p.code != build.code);
+                notes.push(format!(
+                    "gave up on {} ({}) after {tries} runs: {err}; its APK stays at {}",
+                    build.name, build.code, build.apk
+                ));
+            }
+        }
+        write_state(paths, state)?;
+    }
     enter(state, "download")?;
     let apk_path = paths.root.join("apk/game.apk");
     download(
@@ -187,9 +246,51 @@ fn run(paths: &Paths, apk: &Apk, state: &mut State) -> Result<(), String> {
         &apk.version_code,
         Duration::from_secs(5),
     )?;
+    publish_build(
+        paths,
+        &apk_path,
+        &apk.version_code,
+        &apk.version_name,
+        state,
+        &enter,
+    )?;
+    state.warnings.extend(notes);
+    eprintln!("[{:>6.1}s] done", started.elapsed().as_secs_f64());
+    Ok(())
+}
+
+/// When the build being replaced never finished, queue its kept APK so it is published before the new one
+fn queue_replaced(prev: &State, kept: Option<PathBuf>, pending: &mut Vec<Pending>) {
+    let numbered = prev.version_code.parse::<u64>().is_ok();
+    if prev.status == "ok" || !numbered || pending.iter().any(|p| p.code == prev.version_code) {
+        return;
+    }
+    match kept {
+        Some(apk) => pending.push(Pending {
+            code: prev.version_code.clone(),
+            name: prev.version_name.clone(),
+            apk: apk.display().to_string(),
+            attempts: 0,
+        }),
+        None => eprintln!(
+            "pending: {} ({}) never finished and its APK is gone",
+            prev.version_name, prev.version_code
+        ),
+    }
+}
+
+/// Extract one APK into output/, pack it and publish it
+fn publish_build(
+    paths: &Paths,
+    apk_path: &Path,
+    code: &str,
+    name: &str,
+    state: &mut State,
+    enter: &dyn Fn(&mut State, &str) -> Result<(), String>,
+) -> Result<(), String> {
     enter(state, "extract")?;
     let output = paths.output();
-    let exported = extract::export(&apk_path, &output, &apk.version_code, &apk.version_name)?;
+    let exported = extract::export(apk_path, &output, code, name)?;
     state.jackets = exported.jackets as u64;
     state.pv = exported.clips as u64;
     state.collection = exported.collection as u64;
@@ -202,37 +303,51 @@ fn run(paths: &Paths, apk: &Apk, state: &mut State) -> Result<(), String> {
     let (_, warnings) = publish(&output, &paths.manifest(), false)?;
     state.warnings.extend(warnings);
     enter(state, "mirror")?;
-    mirror(&output)?;
-    eprintln!("[{:>6.1}s] done", started.elapsed().as_secs_f64());
-    Ok(())
+    mirror(&output)
 }
 
-/// Keep the APK a new version is about to replace: `<archive>/Phigros_<version>.apk`, a hard link when it can be.
+/// Keep the APK a new version is about to replace: `<archive>/Phigros_<version>.apk`, a hard link when it can be, or
+/// `Phigros_<version>-<code>.apk` when another build already took that name.
 /// What the game drops then stays recoverable (removed songs and charts are taken from these). The archive is
 /// UNPACK_APK_ARCHIVE, else `apk/archive` under the root. A failure only warns: it must not hold up the new version
-fn archive_apk(paths: &Paths, version_name: &str) {
-    let name: String = version_name
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '-')
-        .collect();
+fn archive_apk(paths: &Paths, version_name: &str, version_code: &str) -> Option<PathBuf> {
+    let clean = |s: &str| -> String {
+        s.chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '-')
+            .collect()
+    };
+    let name = clean(version_name);
     let apk = paths.root.join("apk/game.apk");
-    if name.is_empty() || !apk.is_file() {
-        return;
+    let stamped = fs::read_to_string(paths.root.join("apk/version.txt"))
+        .is_ok_and(|s| s.trim() == version_code);
+    if name.is_empty() || !apk.is_file() || !stamped {
+        return None;
     }
     let dir = std::env::var("UNPACK_APK_ARCHIVE")
         .ok()
         .filter(|d| !d.trim().is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| paths.root.join("apk/archive"));
-    let dest = dir.join(format!("Phigros_{name}.apk"));
-    if dest.exists() {
-        return;
+    let plain = dir.join(format!("Phigros_{name}.apk"));
+    let coded = dir.join(format!("Phigros_{name}-{}.apk", clean(version_code)));
+    if coded.exists() {
+        return Some(coded);
     }
+    if crate::files::same_file(&plain, &apk) {
+        return Some(plain);
+    }
+    let dest = if plain.exists() { coded } else { plain };
     let kept = fs::create_dir_all(&dir)
         .and_then(|()| fs::hard_link(&apk, &dest).or_else(|_| fs::copy(&apk, &dest).map(|_| ())));
     match kept {
-        Ok(()) => eprintln!("archive: kept {version_name} as {}", dest.display()),
-        Err(err) => eprintln!("archive: {version_name} not kept: {err}"),
+        Ok(()) => {
+            eprintln!("archive: kept {version_name} as {}", dest.display());
+            Some(dest)
+        }
+        Err(err) => {
+            eprintln!("archive: {version_name} not kept: {err}");
+            None
+        }
     }
 }
 
@@ -355,24 +470,74 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("apk")).unwrap();
         fs::write(root.join("apk/game.apk"), b"4.0.1 bytes").unwrap();
+        fs::write(root.join("apk/version.txt"), "157").unwrap();
         let paths = Paths { root: root.clone() };
-        archive_apk(&paths, "4.0.1");
+        archive_apk(&paths, "4.0.1", "157");
+        archive_apk(&paths, "4.0.1", "157");
         let kept = root.join("apk/archive/Phigros_4.0.1.apk");
         assert_eq!(fs::read(&kept).unwrap(), b"4.0.1 bytes");
         // download() renames the new file into place, so the hard link keeps the old bytes
         fs::write(root.join("apk/game.apk.part"), b"newer").unwrap();
         fs::rename(root.join("apk/game.apk.part"), root.join("apk/game.apk")).unwrap();
-        archive_apk(&paths, "4.0.1");
+        assert_eq!(
+            archive_apk(&paths, "4.0.1", "158"),
+            None,
+            "a stamp of another build archives nothing"
+        );
+        fs::write(root.join("apk/version.txt"), "158").unwrap();
+        archive_apk(&paths, "4.0.1", "158");
         assert_eq!(
             fs::read(&kept).unwrap(),
             b"4.0.1 bytes",
             "an archived version is never overwritten"
         );
-        archive_apk(&paths, "../x");
+        let second = root.join("apk/archive/Phigros_4.0.1-158.apk");
+        assert_eq!(
+            fs::read(&second).unwrap(),
+            b"newer",
+            "a second build of one name keeps its code"
+        );
+        assert!(!root.join("apk/archive/Phigros_4.0.1-157.apk").exists());
+        archive_apk(&paths, "../x", "1");
         assert!(root.join("apk/archive/Phigros_..x.apk").exists() || !root.join("x").exists());
         let _ = fs::remove_dir_all(&root);
     }
     use super::*;
+
+    #[test]
+    fn a_build_replaced_before_it_finished_is_queued_once() {
+        let failed = State {
+            status: "error".into(),
+            version_code: "158".into(),
+            version_name: "4.0.1.1".into(),
+            ..State::default()
+        };
+        let mut pending = Vec::new();
+        queue_replaced(&failed, Some("/a/Phigros_4.0.1.1.apk".into()), &mut pending);
+        queue_replaced(&failed, Some("/a/Phigros_4.0.1.1.apk".into()), &mut pending);
+        assert_eq!(
+            pending,
+            vec![Pending {
+                code: "158".into(),
+                name: "4.0.1.1".into(),
+                apk: "/a/Phigros_4.0.1.1.apk".into(),
+                attempts: 0
+            }]
+        );
+        let done = State {
+            status: "ok".into(),
+            version_code: "159".into(),
+            ..State::default()
+        };
+        queue_replaced(&done, Some("/a/b.apk".into()), &mut pending);
+        let gone = State {
+            status: "error".into(),
+            version_code: "160".into(),
+            ..State::default()
+        };
+        queue_replaced(&gone, None, &mut pending);
+        assert_eq!(pending.len(), 1);
+    }
 
     #[test]
     fn backs_off_exponentially_on_repeated_failures_of_one_version() {

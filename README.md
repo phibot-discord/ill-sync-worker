@@ -23,6 +23,28 @@ systemctl --user restart phi-unpackd   # or: sudo systemctl restart phi-unpackd
 | `CLOUDFLARE_R2_BUCKET` | `phi-web-assets` | Target bucket. |
 | `UNPACK_PUBLISH_RPS` | `3` | Upload requests per second across all workers (Cloudflare allows 1,200 API calls per 5 minutes per user, shared with the web UI and bot). `0` disables pacing. |
 | `UNPACK_PUBLISH_ALL` | unset | `1` uploads every object and rewrites KV without checking what R2 and KV hold. |
+| `UNPACK_HISTORY` | unset | `off` skips the history step, `report` lists what it would keep and stops the publish, `force` lifts its cap of 30 changed charts per build. |
+| `UNPACK_APK_ARCHIVE` | `apk/archive` under the root | Where a replaced build's APK is kept, as `Phigros_<version>.apk` (or `-<code>` when that name is taken). |
+
+## Older charts (`history/`)
+
+Before a publish overwrites anything, each EZ–AT chart whose bytes differ from R2 is compared with the one R2 holds
+(`chart_eq`: notes within 0.002 s, judge-line motion as functions of time, invisible padding lines ignored). A real
+change, or a chart the build no longer has, is copied with its pack to `history/<previous version>/`, and
+`history/index.json` gets an era for the song's charts until then. The index is written before the main upload, so a
+retry finds the build done. New songs are recorded from their first build. A build whose name is already recorded
+under another code is `<name>-<code>` (`codes` in the index holds each build's code). Nothing under `history/` is ever
+deleted.
+
+## Builds TapTap replaces
+
+When a new build appears while the previous one never finished, the previous APK is kept and queued (`pending` in
+`state.json`); queued builds are published first, oldest first, and one that fails three runs is left in the archive.
+A build that never got through at all can be added later, between the recorded ones around its code, without touching
+the main tree: `phi-unpackd --insert-build <apk> <code> <name> [--dry-run]`.
+
+Other one-offs: `--export <apk> <dir> <code> <name>` (extract only), `--history-report <dir>` (what publishing it would
+keep, against R2), `--same-chart <old> <new>…`.
 
 ## Jackets
 
@@ -62,7 +84,7 @@ before KV, and a failure there fails the publish. The chart JSON (`application/j
 2.7 GB) is a group of its own after KV, the last one: a failure is a warning, and since objects R2 already
 holds are skipped, the next run sends only what is missing. There is no list of the charts; the web UI builds
 `chart/<id>.0/<LV>.json` itself and should cope with one that is not there yet. R2 is listed once under
-`chart/`, not once per folder. Publish never deletes from R2; only the local `chart/` and `phira/` trees are pruned.
+`chart/`, not once per folder. Keys a build no longer produces are pruned from R2 after a clean publish (see `prune`); `history/` keeps a copy of each chart first.
 
 ## Videos and Collection
 

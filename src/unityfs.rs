@@ -95,6 +95,35 @@ pub fn lz4_block_into(src: &[u8], size: usize, out: &mut Vec<u8>) -> Result<(), 
     Ok(())
 }
 
+/// One LZMA block as UnityFS stores it: the 5-byte properties header, then the stream with no size field
+fn lzma_into(src: &[u8], size: usize, out: &mut Vec<u8>) -> Result<(), String> {
+    let base = out.len();
+    let options = lzma_rs::decompress::Options {
+        unpacked_size: lzma_rs::decompress::UnpackedSize::UseProvided(Some(size as u64)),
+        ..Default::default()
+    };
+    lzma_rs::lzma_decompress_with_options(&mut &src[..], out, &options)
+        .map_err(|e| format!("lzma: {e}"))?;
+    if out.len() - base != size {
+        return Err(format!(
+            "lzma: {} bytes, block says {size}",
+            out.len() - base
+        ));
+    }
+    Ok(())
+}
+
+/// Append one block of `size` bytes compressed with `method` (the low 6 bits of its flags)
+fn block_into(src: &[u8], method: u32, size: usize, out: &mut Vec<u8>) -> Result<(), String> {
+    match method {
+        0 => out.extend_from_slice(src.get(..size).ok_or("unityfs block truncated")?),
+        1 => lzma_into(src, size, out)?,
+        2 | 3 => lz4_block_into(src, size, out)?,
+        other => return Err(format!("unityfs block compression {other}")),
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 pub struct Node {
     pub name: String,
@@ -139,16 +168,8 @@ fn parse_archive(data: &[u8]) -> Result<Archive, String> {
     let info_comp = data
         .get(info_at..info_at + csize as usize)
         .ok_or("unityfs block info truncated")?;
-    let info = if flags & 0x3f == 0 {
-        info_comp
-            .get(..usize_info as usize)
-            .ok_or("unityfs block info truncated")?
-            .to_vec()
-    } else if flags & 0x3f == 2 || flags & 0x3f == 3 {
-        lz4_block(info_comp, usize_info as usize)?
-    } else {
-        return Err(format!("unityfs compression {} is not lz4", flags & 0x3f));
-    };
+    let mut info = Vec::with_capacity(usize_info as usize);
+    block_into(info_comp, flags & 0x3f, usize_info as usize, &mut info)?;
     let mut o = 16;
     let (nb, n) = u32be(&info, o)?;
     o = n;
@@ -210,17 +231,7 @@ fn inflate_until(data: &[u8], archive: &Archive, need: usize) -> Result<Vec<u8>,
             .get(p..p + *comp as usize)
             .ok_or("unityfs data truncated")?;
         p += *comp as usize;
-        if fl & 0x3f == 0 {
-            raw.extend_from_slice(
-                chunk
-                    .get(..*uncomp as usize)
-                    .ok_or("unityfs block truncated")?,
-            );
-        } else if fl & 0x3f == 2 || fl & 0x3f == 3 {
-            lz4_block_into(chunk, *uncomp as usize, &mut raw)?;
-        } else {
-            return Err(format!("unityfs block compression {}", fl & 0x3f));
-        }
+        block_into(chunk, u32::from(fl & 0x3f), *uncomp as usize, &mut raw)?;
         if need > 0 && raw.len() >= need {
             break;
         }
@@ -282,6 +293,22 @@ mod tests {
         // An offset reaching before this block's start is corrupt, even though bytes exist there
         let mut out = b"PRE".to_vec();
         assert!(lz4_block_into(&[0x10, b'a', 2, 0], 6, &mut out).is_err());
+    }
+
+    #[test]
+    fn decodes_unity_lzma_blocks_after_other_bytes() {
+        let payload = b"level0 level0 level0 sharedassets0.assets".repeat(40);
+        let mut block = Vec::new();
+        let options = lzma_rs::compress::Options {
+            unpacked_size: lzma_rs::compress::UnpackedSize::SkipWritingToHeader,
+        };
+        lzma_rs::lzma_compress_with_options(&mut &payload[..], &mut block, &options).unwrap();
+        let mut out = b"PRE".to_vec();
+        block_into(&block, 1, payload.len(), &mut out).unwrap();
+        assert_eq!(&out[..3], b"PRE");
+        assert_eq!(&out[3..], &payload[..]);
+        assert!(block_into(&block, 1, payload.len() + 1, &mut Vec::new()).is_err());
+        assert!(block_into(&block, 4, payload.len(), &mut Vec::new()).is_err());
     }
 
     #[test]

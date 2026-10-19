@@ -1,11 +1,13 @@
 pub mod audio;
 pub mod catalog;
+pub mod chart_eq;
 pub mod collection;
 pub mod collection_art;
 pub mod cursor;
 pub mod extract;
 pub mod files;
 pub mod gameinfo;
+pub mod history;
 pub mod jackets;
 pub mod job;
 pub mod layout;

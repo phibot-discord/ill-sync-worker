@@ -66,7 +66,7 @@ pub fn link_or_copy(src: &Path, dest: &Path) -> Result<(), String> {
 }
 
 #[cfg(unix)]
-fn same_file(a: &Path, b: &Path) -> bool {
+pub(crate) fn same_file(a: &Path, b: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
     match (fs::metadata(a), fs::metadata(b)) {
         (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
@@ -75,7 +75,7 @@ fn same_file(a: &Path, b: &Path) -> bool {
 }
 
 #[cfg(not(unix))]
-fn same_file(_: &Path, _: &Path) -> bool {
+pub(crate) fn same_file(_: &Path, _: &Path) -> bool {
     false
 }
 

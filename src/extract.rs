@@ -22,6 +22,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use zip::ZipArchive;
 
+const DATA_DIR: &str = "assets/bin/Data/";
 const PACKED_DATA: &str = "assets/bin/Data/data.unity3d";
 /// The il2cpp string table: what the game's code says, byte for byte
 pub const METADATA: &str = "assets/bin/Data/Managed/Metadata/global-metadata.dat";
@@ -88,21 +89,14 @@ impl Extras {
 
 fn export_extras(
     zip: &mut ZipArchive<File>,
+    names: &[String],
     packed: Option<&[u8]>,
     videos: &[catalog::BundleJob],
     arts: &[catalog::BundleJob],
     output: &Path,
 ) -> Extras {
     let mut out = Extras::default();
-    let parsed = packed
-        .ok_or_else(|| "apk has no data.unity3d".to_string())
-        .and_then(|bytes| unityfs::decode_where(bytes, |n| !unityfs::is_resource(n)))
-        .map(|nodes| {
-            nodes
-                .into_iter()
-                .map(|n| (n.name, n.bytes))
-                .collect::<HashMap<_, _>>()
-        })
+    let parsed = game_nodes(zip, names, packed)
         .and_then(|nodes| pv::scenes_in(&nodes).map(|scenes| (nodes, scenes)));
     match parsed {
         Ok((nodes, scenes)) => {
@@ -116,6 +110,7 @@ fn export_extras(
             }
             match export_collection_art(
                 zip,
+                names,
                 packed,
                 &nodes,
                 &scenes,
@@ -222,6 +217,7 @@ struct ArtExport {
 /// encoded before anything is written, and the manifest goes last
 fn export_collection_art(
     zip: &mut ZipArchive<File>,
+    names: &[String],
     packed: Option<&[u8]>,
     nodes: &HashMap<String, Vec<u8>>,
     scenes: &[String],
@@ -241,13 +237,7 @@ fn export_collection_art(
             calls.extend(found.into_iter().map(|call| (scene.clone(), call)));
         }
     }
-    let (tiles, mut warnings) = match packed {
-        Some(packed) => map_tiles(packed, nodes, &maps),
-        None => (
-            Vec::new(),
-            vec!["no map tiles: apk has no data.unity3d".into()],
-        ),
-    };
+    let (tiles, mut warnings) = map_tiles(zip, names, packed, nodes, &maps);
     let mut found = Vec::new();
     let mut images = HashMap::new();
     for job in arts {
@@ -312,7 +302,9 @@ fn export_collection_art(
 /// The tiles of the map scenes (`maps`, build indexes): each scene read with the shared files its objects reference
 /// and the streamed texture data of its own shared assets
 fn map_tiles(
-    packed: &[u8],
+    zip: &mut ZipArchive<File>,
+    names: &[String],
+    packed: Option<&[u8]>,
     nodes: &HashMap<String, Vec<u8>>,
     maps: &[usize],
 ) -> collection_art::SceneTiles {
@@ -320,9 +312,22 @@ fn map_tiles(
     let mut warnings = Vec::new();
     for &n in maps {
         let own = format!("sharedassets{n}.assets");
-        let streamed = match unityfs::decode_where(packed, |name| {
-            unityfs::is_resource(name) && name.starts_with(&own) && name.ends_with(".resS")
-        }) {
+        let ours = |name: &str| name.starts_with(&own) && name.ends_with(".resS");
+        let streamed = match packed {
+            Some(packed) => {
+                unityfs::decode_where(packed, |name| unityfs::is_resource(name) && ours(name))
+            }
+            None => loose_files(names, ours)
+                .into_iter()
+                .map(|(name, parts)| {
+                    Ok(unityfs::Node {
+                        name,
+                        bytes: read_parts(zip, &parts)?,
+                    })
+                })
+                .collect(),
+        };
+        let streamed = match streamed {
             Ok(found) => found,
             Err(err) => {
                 warnings.push(format!("map tiles of scene {n}: {err}"));
@@ -376,6 +381,7 @@ pub fn export_game_extras(apk: &Path, output: &Path) -> Result<(usize, usize, us
     let jobs = bundle_jobs(&mut zip, &names)?;
     let extras = export_extras(
         &mut zip,
+        &names,
         packed.as_deref(),
         &jobs.videos,
         &jobs.arts,
@@ -441,7 +447,7 @@ pub fn export(
         arts,
         rest: jobs,
     } = bundle_jobs(&mut zip, &names)?;
-    let extras = export_extras(&mut zip, packed.as_deref(), &videos, &arts, output);
+    let extras = export_extras(&mut zip, &names, packed.as_deref(), &videos, &arts, output);
     drop(packed);
     eprintln!(
         "videos: {}, collection entries: {}, collection art: {}",
@@ -639,14 +645,69 @@ fn read_level0(
     if let Some(packed) = packed {
         return unityfs::read_named(packed, "level0");
     }
-    let mut parts: Vec<&String> = names
-        .iter()
-        .filter(|n| n.ends_with("/level0") || n.contains("/level0.split"))
-        .collect();
-    parts.sort_by_key(|n| split_ord(n));
-    if parts.is_empty() {
-        return Err("apk has no level0 and no data.unity3d".into());
+    let parts = loose_files(names, |name| name == "level0")
+        .remove("level0")
+        .ok_or("apk has no level0 and no data.unity3d")?;
+    read_parts(zip, &parts)
+}
+
+/// The scenes and the files they share, by name: unpacked from `data.unity3d`, or (4.0.1.1 on) the loose files
+fn game_nodes(
+    zip: &mut ZipArchive<File>,
+    names: &[String],
+    packed: Option<&[u8]>,
+) -> Result<HashMap<String, Vec<u8>>, String> {
+    if let Some(bytes) = packed {
+        let nodes = unityfs::decode_where(bytes, |n| !unityfs::is_resource(n))?;
+        return Ok(nodes.into_iter().map(|n| (n.name, n.bytes)).collect());
     }
+    let files = loose_files(names, is_scene_file);
+    if !files.contains_key("globalgamemanagers") {
+        return Err("apk has no data.unity3d and no loose globalgamemanagers".into());
+    }
+    files
+        .into_iter()
+        .map(|(name, parts)| Ok((name, read_parts(zip, &parts)?)))
+        .collect()
+}
+
+/// A serialized file a scene export reads: build settings, scenes and their shared assets
+fn is_scene_file(name: &str) -> bool {
+    let numbered = |prefix: &str, rest: &str| {
+        name.strip_prefix(prefix)
+            .and_then(|n| n.strip_suffix(rest))
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+    };
+    matches!(
+        name,
+        "globalgamemanagers" | "globalgamemanagers.assets" | "resources.assets"
+    ) || numbered("level", "")
+        || numbered("sharedassets", ".assets")
+}
+
+/// Files directly in assets/bin/Data whose name passes `keep`, each with its zip entries in order: one, or the
+/// `.splitN` parts a large file is cut into
+fn loose_files(names: &[String], keep: impl Fn(&str) -> bool) -> BTreeMap<String, Vec<&String>> {
+    let mut files: BTreeMap<String, Vec<&String>> = BTreeMap::new();
+    for name in names {
+        let Some(file) = name.strip_prefix(DATA_DIR).filter(|f| !f.contains('/')) else {
+            continue;
+        };
+        let base = file
+            .rsplit_once(".split")
+            .filter(|(_, n)| n.parse::<u32>().is_ok())
+            .map_or(file, |(base, _)| base);
+        if keep(base) {
+            files.entry(base.to_string()).or_default().push(name);
+        }
+    }
+    for parts in files.values_mut() {
+        parts.sort_by_key(|n| split_ord(n));
+    }
+    files
+}
+
+fn read_parts(zip: &mut ZipArchive<File>, parts: &[&String]) -> Result<Vec<u8>, String> {
     let mut all = Vec::new();
     for name in parts {
         all.extend(read_zip(zip, name)?);
@@ -726,11 +787,23 @@ struct NoteTime {
     hold_time: f64,
 }
 
+/// The chart a TextAsset holds: the object that opens with `formatVersion`, compact or (4.0.1.1 on) indented
 pub fn carve_chart(nodes: &[unityfs::Node]) -> Result<(Vec<u8>, NoteCounts), String> {
-    let needle = b"{\"formatVersion\"";
+    let needle = b"\"formatVersion\"";
     for node in nodes {
-        if let Some(rel) = find(&node.bytes, needle) {
-            let slice = &node.bytes[rel..];
+        let bytes = &node.bytes;
+        let mut from = 0;
+        while let Some(rel) = find(&bytes[from..], needle) {
+            let key = from + rel;
+            from = key + needle.len();
+            let Some(rel) = bytes[..key]
+                .iter()
+                .rposition(|b| !b.is_ascii_whitespace())
+                .filter(|&open| bytes[open] == b'{')
+            else {
+                continue;
+            };
+            let slice = &bytes[rel..];
             let mut stream = serde_json::Deserializer::from_slice(slice).into_iter::<ChartNotes>();
             if let Some(Ok(ChartNotes { lines: Some(lines) })) = stream.next() {
                 let end = stream.byte_offset();
@@ -739,7 +812,7 @@ pub fn carve_chart(nodes: &[unityfs::Node]) -> Result<(Vec<u8>, NoteCounts), Str
             let end = json_end(slice)?;
             let value: Value = serde_json::from_slice(&slice[..end]).map_err(|e| e.to_string())?;
             if value.get("judgeLineList").is_none() {
-                continue;
+                break;
             }
             return Ok((slice[..end].to_vec(), count_notes(&value)));
         }
@@ -951,5 +1024,18 @@ mod tests {
         let (_, stats) = carve_chart(&[chart(plain)]).unwrap();
         assert_eq!(stats, ([0, 0, 1, 1], 9.0));
         assert!(carve_chart(&[chart(r#""other":1"#)]).is_err());
+    }
+
+    #[test]
+    fn finds_indented_charts_like_the_new_sp_ones() {
+        let node = unityfs::Node {
+            name: "CAB".into(),
+            bytes: b"\x08\0\0\0Chart_SP\xff\xff\x17\0{\n    \"formatVersion\": 2,\n    \"judgeLineList\": [{\"notesAbove\": [{\"type\": 1, \"time\": 4}], \"notesBelow\": []}]\n}tail"
+                .to_vec(),
+        };
+        let (body, (counts, _)) = carve_chart(&[node]).unwrap();
+        assert!(body.starts_with(b"{\n    \"formatVersion\": 2"));
+        assert!(body.ends_with(b"]\n}"));
+        assert_eq!(counts, [1, 0, 0, 0]);
     }
 }

@@ -28,8 +28,67 @@ struct Req {
 }
 
 fn main() {
-    // --extras <apk> <dir>: only the videos, the Collection and its art; touches no UNPACK_ROOT and uploads nothing
     let args: Vec<String> = std::env::args().collect();
+    // --export <apk> <dir> <code> <name>: extract only, into any directory; --history-report <dir>: what publishing
+    // it would add to history/ (reads R2, writes nothing)
+    if let Some(at) = args.iter().position(|arg| arg == "--export") {
+        let arg = |n: usize| args.get(at + n).cloned().unwrap_or_default();
+        match phi_unpackd::extract::export(arg(1).as_ref(), arg(2).as_ref(), &arg(3), &arg(4)) {
+            Ok(done) => println!("jackets {} warnings {:?}", done.jackets, done.warnings),
+            Err(err) => {
+                eprintln!("export failed: {err}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+    // --insert-build <apk> <code> <name> [--dry-run]: a build that never got through in order, added to history/ only
+    if let Some(at) = args.iter().position(|arg| arg == "--insert-build") {
+        let arg = |n: usize| args.get(at + n).cloned().unwrap_or_default();
+        let paths = Paths::from_env();
+        let _lock = match paths.try_lock() {
+            Ok(Some(lock)) => lock,
+            Ok(None) => {
+                eprintln!("another unpack is running");
+                std::process::exit(1);
+            }
+            Err(err) => {
+                eprintln!("lock failed: {err}");
+                std::process::exit(1);
+            }
+        };
+        let out = paths.root.join("insert").join(arg(2));
+        let done = phi_unpackd::extract::export(arg(1).as_ref(), &out, &arg(2), &arg(3))
+            .and_then(|_| phi_unpackd::layout::write_info_tsv(&out))
+            .and_then(|_| phi_unpackd::pez::pack_all(&out))
+            .and_then(|_| {
+                phi_unpackd::publish::insert_build(&out, args.iter().any(|a| a == "--dry-run"))
+            });
+        if let Err(err) = done {
+            eprintln!("insert failed: {err}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if let Some(at) = args.iter().position(|arg| arg == "--history-report") {
+        let out = args.get(at + 1).cloned().unwrap_or_default();
+        if let Err(err) = phi_unpackd::publish::history_report(out.as_ref()) {
+            eprintln!("history report failed: {err}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    // --extras <apk> <dir>: only the videos, the Collection and its art; touches no UNPACK_ROOT and uploads nothing
+    // --same-chart <old> <new>...: each new chart against the old one, "same" or what differs
+    if let Some(at) = args.iter().position(|arg| arg == "--same-chart") {
+        let read = |p: &String| std::fs::read(p).unwrap_or_else(|e| panic!("{p}: {e}"));
+        let old = read(&args[at + 1]);
+        for new in &args[at + 2..] {
+            let verdict = phi_unpackd::chart_eq::compare(&old, &read(new));
+            println!("{new}\t{}", verdict.as_deref().unwrap_or("same"));
+        }
+        return;
+    }
     if let Some(at) = args.iter().position(|arg| arg == "--extras") {
         let (Some(apk), Some(out)) = (args.get(at + 1), args.get(at + 2)) else {
             eprintln!("usage: phi-unpackd --extras <apk> <output dir>");

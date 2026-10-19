@@ -1,12 +1,14 @@
+use crate::chart_eq;
 use crate::collection_art;
 use crate::extract;
 use crate::files::write_if_changed;
+use crate::history::{self, EraChart, SongChange};
 use crate::layout::{self, song_id, LEVELS};
 use crate::par;
 use crate::pv;
 use md5::Md5;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File};
@@ -27,6 +29,8 @@ const API: &str = "https://api.cloudflare.com/client/v4";
 const LIST_PAGE_CAP: usize = 50;
 /// Extract's chart tree, uploaded under the same name: `chart/<folder>/<LEVEL>.json`
 const CHART_DIR: &str = "chart";
+/// More changed charts than this in one version is more likely a re-encode the comparison misses than real edits
+const HISTORY_CAP: usize = 30;
 /// How often put_all saves published.json while uploading, so a crash loses little
 const MANIFEST_SAVE_EVERY: Duration = Duration::from_secs(30);
 
@@ -338,6 +342,15 @@ pub fn publish(
             }
         }
     };
+    let history_mode = std::env::var("UNPACK_HISTORY").unwrap_or_default();
+    keep_history(
+        &creds,
+        &pacer,
+        output,
+        &chart_files,
+        remote.as_ref(),
+        &history_mode,
+    )?;
     let manifest = Mutex::new(Manifest::load(manifest_path, &creds));
     let uploader = Uploader {
         creds: &creds,
@@ -635,6 +648,548 @@ fn json_file(output: &Path, key: &str) -> Option<Upload> {
         key: key.to_string(),
         mime: "application/json",
     })
+}
+
+/// Before the main tree is overwritten: each EZ–AT chart this version changes (by chart_eq, not by bytes) or drops is
+/// copied with its pack to `history/<previous version>/`, then history/index.json is written, ahead of every other upload
+/// so a retry finds the version done. UNPACK_HISTORY=off skips this, `report` lists the changes and stops the publish,
+/// `force` lifts HISTORY_CAP
+fn keep_history(
+    creds: &Creds,
+    pacer: &Pacer,
+    output: &Path,
+    charts: &[Upload],
+    remote: Option<&HashMap<String, Remote>>,
+    mode: &str,
+) -> Result<(), String> {
+    if mode == "off" {
+        return Ok(());
+    }
+    let (name, code) = build_of(output);
+    if name.is_empty() {
+        eprintln!("history: skipped, this output has no version name");
+        return Ok(());
+    }
+    let Some(mut index) = load_index(creds, pacer)? else {
+        return Ok(());
+    };
+    let known = history::versions(&index);
+    let next = history::version_id(&index, &name, code);
+    if known.contains(&next) {
+        eprintln!("history: {next} is already recorded");
+        return Ok(());
+    }
+    if let Some(newer) = history::newer_than(&index, code) {
+        return Err(format!(
+            "history: {name} ({code}) is older than {newer}, which is published; add it with --insert-build"
+        ));
+    }
+    let prev = known
+        .last()
+        .cloned()
+        .ok_or("history: the index lists no versions")?;
+    let listed;
+    let remote = match remote {
+        Some(remote) => remote,
+        None => {
+            listed = list_remote(creds, &[format!("{CHART_DIR}/")], pacer)?;
+            &listed
+        }
+    };
+    let produced = level_charts(charts);
+    let mut old: HashMap<String, Vec<u8>> = HashMap::new();
+    let mut changed: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (key, chart) in &produced {
+        let Some(there) = remote.get(key) else {
+            continue;
+        };
+        let local = Published::of_file(&chart.path, chart.mime)?;
+        if there.etag.as_deref() == Some(local.md5.as_str()) {
+            continue;
+        }
+        pacer.wait();
+        let Some(before) = get_object(creds, key)? else {
+            continue;
+        };
+        let now = fs::read(&chart.path).map_err(|e| format!("{}: {e}", chart.path.display()))?;
+        if let Some(why) = chart_eq::compare(&before, &now) {
+            eprintln!("history: {key} changed: {why}");
+            let (stem, level) = split_chart_key(key);
+            changed.entry(stem).or_default().push(level);
+            old.insert(key.clone(), before);
+        }
+    }
+    let mut gone: Vec<&String> = remote
+        .keys()
+        .filter(|k| is_level_chart(k) && !produced.contains_key(*k))
+        .collect();
+    gone.sort();
+    for key in gone {
+        pacer.wait();
+        if let Some(before) = get_object(creds, key)? {
+            eprintln!("history: {key} is gone from this version");
+            let (stem, level) = split_chart_key(key);
+            changed.entry(stem).or_default().push(level);
+            old.insert(key.clone(), before);
+        }
+    }
+    let count: usize = changed.values().map(Vec::len).sum();
+    eprintln!(
+        "history: {prev} -> {next}, {count} changed charts in {} songs",
+        changed.len()
+    );
+    if count > HISTORY_CAP && mode != "force" {
+        return Err(format!(
+            "history: {count} changed charts is more than {HISTORY_CAP}; nothing published (UNPACK_HISTORY=force keeps them all, =off skips history)"
+        ));
+    }
+    if mode == "report" {
+        return Err("history: report only, nothing published".into());
+    }
+    let info = remote_info(creds, pacer)?;
+    let folders = song_folders(charts);
+    let mut changes = Vec::new();
+    let mut restored = BTreeSet::new();
+    for (stem, levels) in &changed {
+        let mut before = BTreeMap::new();
+        for level in LEVELS {
+            let key = format!("{CHART_DIR}/{stem}/{level}.json");
+            if !remote.contains_key(&key) {
+                continue;
+            }
+            if !old.contains_key(&key) {
+                pacer.wait();
+                if let Some(bytes) = get_object(creds, &key)? {
+                    old.insert(key.clone(), bytes);
+                }
+            }
+            let notes = old
+                .get(&key)
+                .and_then(|b| chart_eq::note_count(b))
+                .unwrap_or(0);
+            before.insert(level.to_string(), era_chart_of(&info, stem, level, notes));
+        }
+        for level in levels {
+            let chart_key = format!("{CHART_DIR}/{stem}/{level}.json");
+            if let Some(chart) = produced.get(&chart_key) {
+                let now = fs::read(&chart.path).map_err(|e| e.to_string())?;
+                for (era, rev) in history::revs_of(&index, stem, level) {
+                    let key = history::key_in(&rev, &chart_key);
+                    pacer.wait();
+                    let back = get_object(creds, &key)?
+                        .is_some_and(|copy| chart_eq::compare(&copy, &now).is_none());
+                    if back {
+                        eprintln!("history: {stem} {level} is back to its {rev} chart");
+                        restored.insert((stem.clone(), level.clone(), era));
+                    }
+                }
+            }
+            let pack_key = format!("phira/{level}/{stem}-{level}.pez");
+            pacer.wait();
+            match get_object(creds, &pack_key)? {
+                Some(pack) => put_bytes(
+                    creds,
+                    &pack,
+                    &history::key_in(&prev, &pack_key),
+                    "application/octet-stream",
+                )?,
+                None => eprintln!("history: R2 has no {pack_key} to keep"),
+            }
+            pacer.wait();
+            put_bytes(
+                creds,
+                &old[&chart_key],
+                &history::key_in(&prev, &chart_key),
+                "application/json",
+            )?;
+            eprintln!(
+                "history: kept {chart_key} under {}/{prev}/",
+                history::PREFIX
+            );
+        }
+        changes.push(SongChange {
+            id: song_id_of(&index, &folders, stem),
+            stem: stem.clone(),
+            before,
+            changed: levels.clone(),
+        });
+    }
+    let present: Vec<String> = folders.keys().cloned().collect();
+    let new_songs: Vec<(String, String)> = folders
+        .iter()
+        .filter(|(stem, _)| {
+            let dir = format!("{CHART_DIR}/{stem}/");
+            !remote.keys().any(|k| k.starts_with(&dir))
+        })
+        .map(|(stem, folder)| (folder.clone(), stem.clone()))
+        .collect();
+    for (_, stem) in &new_songs {
+        eprintln!("history: {stem} is new in {next}");
+    }
+    history::advance(
+        &mut index,
+        &prev,
+        &next,
+        code,
+        &present,
+        &new_songs,
+        &changes,
+        &|stem, level, era| restored.contains(&(stem.to_string(), level.to_string(), era)),
+    );
+    save_index(creds, pacer, &index)?;
+    eprintln!("history: wrote {} for {next}", history::INDEX);
+    Ok(())
+}
+
+/// A build that never went through in order (TapTap replaced it first): its charts become a version of their own between
+/// the recorded builds around its code. Writes only under history/; the main tree keeps serving the newest build
+pub fn insert_build(output: &Path, dry_run: bool) -> Result<(), String> {
+    let creds = Creds::from_env()?;
+    let pacer = Pacer::from_env();
+    let (name, code) = build_of(output);
+    if name.is_empty() || code == 0 {
+        return Err("this output has no version name and code".into());
+    }
+    let mut index = load_index(&creds, &pacer)?.ok_or("R2 has no history index")?;
+    let x = history::version_id(&index, &name, code);
+    let all = history::versions(&index);
+    if all.contains(&x) {
+        eprintln!("history: {x} is already recorded");
+        return Ok(());
+    }
+    let pos = all
+        .iter()
+        .position(|v| index["codes"][v].as_i64().is_some_and(|c| c > code))
+        .ok_or(format!(
+            "nothing newer than {name} ({code}) is recorded; publish it the usual way"
+        ))?;
+    let next = all[pos].clone();
+    let prev = pos.checked_sub(1).map(|p| all[p].clone());
+    eprintln!(
+        "history: adding {x} between {} and {next}",
+        prev.as_deref().unwrap_or("-")
+    );
+    let remote = list_remote(&creds, &[format!("{CHART_DIR}/")], &pacer)?;
+    let charts = charts(output);
+    let produced = level_charts(&charts);
+    let folders = song_folders(&charts);
+    let info = info_rows(&info_csv(&output.join("info/songs.json"))?);
+    let mut cache: HashMap<String, Option<Vec<u8>>> = HashMap::new();
+    let mut fetch = |key: String| -> Result<Option<Vec<u8>>, String> {
+        if let Some(hit) = cache.get(&key) {
+            return Ok(hit.clone());
+        }
+        pacer.wait();
+        let got = get_object(&creds, &key)?;
+        cache.insert(key, got.clone());
+        Ok(got)
+    };
+    let mut placements = Vec::new();
+    let mut copies = Vec::new();
+    for stem in folders.keys() {
+        let mut same_next = true;
+        let mut same_prev = prev.is_some();
+        let mut charts_x = Map::new();
+        let mut levels_x = BTreeSet::new();
+        for level in LEVELS {
+            let key = format!("{CHART_DIR}/{stem}/{level}.json");
+            let Some(chart) = produced.get(&key) else {
+                continue;
+            };
+            levels_x.insert(level);
+            let now = fs::read(&chart.path).map_err(|e| e.to_string())?;
+            let local = Published::of_file(&chart.path, chart.mime)?;
+            let mut matches = |version: &str| -> Result<Option<history::Source>, String> {
+                let source = history::source_at(&index, stem, level, version);
+                let bytes = match &source {
+                    history::Source::Missing => return Ok(None),
+                    history::Source::Current => {
+                        let Some(there) = remote.get(&key) else {
+                            return Ok(None);
+                        };
+                        if there.etag.as_deref() == Some(local.md5.as_str()) {
+                            return Ok(Some(source));
+                        }
+                        fetch(key.clone())?
+                    }
+                    history::Source::Copy(rev) => fetch(history::key_in(rev, &key))?,
+                };
+                Ok(bytes
+                    .filter(|b| chart_eq::compare(b, &now).is_none())
+                    .map(|_| source))
+            };
+            let at_next = matches(&next)?;
+            let at_prev = match &prev {
+                Some(prev) => matches(prev)?,
+                None => None,
+            };
+            same_next &= at_next.is_some();
+            same_prev &= at_prev.is_some();
+            let notes = chart_eq::note_count(&now).unwrap_or(0);
+            let era_chart = era_chart_of(&info, stem, level, notes);
+            let entry = match at_next.or(at_prev) {
+                Some(source) => history::era_chart_from(&era_chart, &source),
+                None => {
+                    copies.push((stem.clone(), level));
+                    history::era_chart_from(&era_chart, &history::Source::Copy(x.clone()))
+                }
+            };
+            charts_x.insert(level.to_string(), entry);
+        }
+        let levels_at = |version: &str| -> BTreeSet<&str> {
+            LEVELS
+                .into_iter()
+                .filter(
+                    |level| match history::source_at(&index, stem, level, version) {
+                        history::Source::Current => {
+                            remote.contains_key(&format!("{CHART_DIR}/{stem}/{level}.json"))
+                        }
+                        history::Source::Copy(_) => true,
+                        history::Source::Missing => false,
+                    },
+                )
+                .collect()
+        };
+        same_next &= levels_at(&next) == levels_x;
+        same_prev &= prev.as_deref().is_some_and(|p| levels_at(p) == levels_x);
+        let placement = if same_next {
+            history::Placement::SameAsNext
+        } else if same_prev {
+            history::Placement::SameAsPrev
+        } else {
+            eprintln!("history: {stem} differs in {x}");
+            history::Placement::Era(charts_x)
+        };
+        placements.push((song_id_of(&index, &folders, stem), stem.clone(), placement));
+    }
+    let count = |want: fn(&history::Placement) -> bool| {
+        placements.iter().filter(|(_, _, p)| want(p)).count()
+    };
+    eprintln!(
+        "history: {x}: {} songs as in {next}, {} as in {}, {} with charts of their own",
+        count(|p| matches!(p, history::Placement::SameAsNext)),
+        count(|p| matches!(p, history::Placement::SameAsPrev)),
+        prev.as_deref().unwrap_or("-"),
+        count(|p| matches!(p, history::Placement::Era(_))),
+    );
+    if dry_run {
+        return Ok(());
+    }
+    let era_songs: BTreeSet<&String> = placements
+        .iter()
+        .filter(|(_, _, p)| matches!(p, history::Placement::Era(_)))
+        .map(|(_, stem, _)| stem)
+        .collect();
+    for (stem, level) in copies.iter().filter(|(stem, _)| era_songs.contains(stem)) {
+        let chart_key = format!("{CHART_DIR}/{stem}/{level}.json");
+        let pack_key = format!("phira/{level}/{stem}-{level}.pez");
+        let pack = output.join(&pack_key);
+        pacer.wait();
+        if pack.is_file() {
+            put_file(
+                &creds,
+                &pack,
+                &history::key_in(&x, &pack_key),
+                "application/octet-stream",
+            )?;
+        } else {
+            eprintln!("history: {x} has no {pack_key} to keep");
+        }
+        pacer.wait();
+        put_file(
+            &creds,
+            &produced[&chart_key].path,
+            &history::key_in(&x, &chart_key),
+            "application/json",
+        )?;
+        eprintln!("history: kept {chart_key} under {}/{x}/", history::PREFIX);
+    }
+    history::insert(&mut index, pos, &x, code, &placements);
+    save_index(&creds, &pacer, &index)?;
+    eprintln!("history: wrote {} with {x}", history::INDEX);
+    Ok(())
+}
+
+/// Version name and code of the build in `output`
+fn build_of(output: &Path) -> (String, i64) {
+    let version: Value = fs::read(output.join("info/version.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default();
+    (
+        text(&version["name"]),
+        version["code"].as_i64().unwrap_or(0),
+    )
+}
+
+fn load_index(creds: &Creds, pacer: &Pacer) -> Result<Option<Value>, String> {
+    pacer.wait();
+    let Some(bytes) = get_object(creds, history::INDEX)? else {
+        eprintln!("history: skipped, R2 has no {}", history::INDEX);
+        return Ok(None);
+    };
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|e| format!("{}: {e}", history::INDEX))
+}
+
+fn save_index(creds: &Creds, pacer: &Pacer, index: &Value) -> Result<(), String> {
+    let body = serde_json::to_vec_pretty(index).map_err(|e| e.to_string())?;
+    pacer.wait();
+    put_bytes(creds, &body, history::INDEX, "application/json")
+}
+
+fn is_level_chart(key: &str) -> bool {
+    key.strip_prefix(&format!("{CHART_DIR}/"))
+        .and_then(|rest| rest.rsplit_once('/'))
+        .and_then(|(_, file)| file.strip_suffix(".json"))
+        .is_some_and(|level| LEVELS.contains(&level))
+}
+
+/// `chart/<stem>/<LEVEL>.json` → (stem, level)
+fn split_chart_key(key: &str) -> (String, String) {
+    let rest = key.strip_prefix(&format!("{CHART_DIR}/")).unwrap_or(key);
+    let (stem, file) = rest.rsplit_once('/').unwrap_or(("", rest));
+    (stem.to_string(), file.trim_end_matches(".json").to_string())
+}
+
+/// EZ–AT chart uploads by key
+fn level_charts(charts: &[Upload]) -> BTreeMap<String, &Upload> {
+    charts
+        .iter()
+        .filter(|u| is_level_chart(&u.key))
+        .map(|u| (u.key.clone(), u))
+        .collect()
+}
+
+/// Song stem → its track folder, for every song the output has charts for
+fn song_folders(charts: &[Upload]) -> BTreeMap<String, String> {
+    charts
+        .iter()
+        .filter_map(|u| {
+            u.path
+                .parent()?
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+        })
+        .map(|folder| (song_id(&folder).to_string(), folder))
+        .collect()
+}
+
+/// The id the index gives `stem`, else its track folder, else `<stem>.0`
+fn song_id_of(index: &Value, folders: &BTreeMap<String, String>, stem: &str) -> String {
+    index["songs"]
+        .as_array()
+        .and_then(|songs| songs.iter().find(|s| s["stem"] == stem))
+        .and_then(|s| s["id"].as_str().map(String::from))
+        .or_else(|| folders.get(stem).cloned())
+        .unwrap_or_else(|| format!("{stem}.0"))
+}
+
+/// R2's info.csv as it was before this publish
+fn remote_info(creds: &Creds, pacer: &Pacer) -> Result<HashMap<String, Vec<String>>, String> {
+    pacer.wait();
+    let bytes = get_object(creds, "info/info.csv")?.unwrap_or_default();
+    Ok(info_rows(&String::from_utf8_lossy(&bytes)))
+}
+
+fn info_rows(csv: &str) -> HashMap<String, Vec<String>> {
+    csv.lines()
+        .skip(1)
+        .filter_map(|line| {
+            let cells: Vec<String> = line.split('\t').map(String::from).collect();
+            Some((cells.first()?.clone(), cells))
+        })
+        .collect()
+}
+
+/// Label (constant) and charter from info.csv rows (`id song composer illustrator EZC..ATC EZ..AT`)
+fn era_chart_of(
+    info: &HashMap<String, Vec<String>>,
+    stem: &str,
+    level: &str,
+    notes: usize,
+) -> EraChart {
+    let n = LEVELS.iter().position(|l| *l == level).unwrap_or(0);
+    let cell = |at: usize| {
+        info.get(stem)
+            .and_then(|r| r.get(at))
+            .map(|c| c.trim().to_string())
+            .unwrap_or_default()
+    };
+    let label = cell(8 + n);
+    EraChart {
+        label: if label.is_empty() { "?".into() } else { label },
+        notes,
+        charter: cell(4 + n),
+    }
+}
+
+/// GET one object through the API; None when R2 has no such key
+fn get_object(creds: &Creds, key: &str) -> Result<Option<Vec<u8>>, String> {
+    let url = format!(
+        "{API}/accounts/{}/r2/buckets/{}/objects/{}",
+        creds.account,
+        encode(&creds.bucket),
+        object_path(key),
+    );
+    let tmp = scratch_file("get");
+    let out = Command::new("curl")
+        .args([
+            "-sS",
+            "--connect-timeout",
+            "15",
+            "--max-time",
+            "600",
+            "--retry",
+            "3",
+        ])
+        .args(["-o", &tmp.to_string_lossy(), "-w", "%{http_code}"])
+        .args(["-H", &format!("Authorization: Bearer {}", creds.token)])
+        .arg(&url)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("curl: {e}"))?;
+    let code = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let body = fs::read(&tmp);
+    let _ = fs::remove_file(&tmp);
+    match code.as_str() {
+        "200" if out.status.success() => body.map(Some).map_err(|e| format!("get {key}: {e}")),
+        "404" => Ok(None),
+        _ => Err(format!(
+            "get {key}: HTTP {code} {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )),
+    }
+}
+
+fn put_bytes(creds: &Creds, bytes: &[u8], key: &str, mime: &str) -> Result<(), String> {
+    let tmp = scratch_file("put");
+    fs::write(&tmp, bytes).map_err(|e| format!("{}: {e}", tmp.display()))?;
+    let result = put_file(creds, &tmp, key, mime).map_err(|e| format!("{key}: {e}"));
+    let _ = fs::remove_file(&tmp);
+    result
+}
+
+fn scratch_file(kind: &str) -> PathBuf {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    std::env::temp_dir().join(format!(
+        "phi-unpackd-{kind}-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
+/// What publishing `output` would add to history/, against R2 as it is; uploads nothing
+pub fn history_report(output: &Path) -> Result<(), String> {
+    let creds = Creds::from_env()?;
+    let pacer = Pacer::from_env();
+    let charts = charts(output);
+    let remote = list_remote(&creds, &[format!("{CHART_DIR}/")], &pacer)?;
+    match keep_history(&creds, &pacer, output, &charts, Some(&remote), "report") {
+        Err(err) if err.ends_with("report only, nothing published") => Ok(()),
+        other => other,
+    }
 }
 
 /// Every object R2 holds under `prefixes`: key -> size, etag, content type
